@@ -88,7 +88,7 @@ inspects hardware itself, supporting a new accelerator never touches the core.
 
 ## Quick start
 
-Requires Rust (stable), the MSVC build tools on Windows, and Python 3.10+.
+Requires Rust (stable), the MSVC build tools on Windows, and Python 3.11+.
 
 ```powershell
 git clone https://github.com/tonyt123456/pytorches
@@ -143,6 +143,39 @@ t.to("cuda:0")                                # any device from pt.devices()
 *Advanced:* plugins are found in `$PYTORCHES_PLUGIN_DIR`, else `./plugins/bin`, else
 `<exe dir>/plugins`. Only files named `pytorches_plugin_*` are considered.
 
+## Works with PyTorch
+
+Tensors and checkpoints move between the two libraries, and every claim below is tested against the
+real PyTorch (and the reference `safetensors` package) in `tests/diff/test_interop.py`.
+
+```python
+import torch, pytorches as pt
+
+# DLPack: zero-copy on the CPU, in both directions (shared memory, safe lifetimes)
+t = pt.from_torch(torch_tensor)          # or pt.from_dlpack(any_dlpack_object)
+x = pt.to_torch(t)                       # or torch.from_dlpack(t)
+
+# Checkpoints: PyTorch's key names and layouts, so weights load straight across
+model = pt.nn.mlp([784, 256, 10])
+model.load_state_dict(pt.from_torch_state_dict(torch_model.state_dict()))   # from torch
+torch_model.load_state_dict({k: pt.to_torch(v) for k, v in model.state_dict().items()})  # to torch
+
+# safetensors (any of F32/F16/BF16/F64/ints/bool, loaded as float32) and torch.save files
+weights = pt.safetensors.load("model.safetensors", device="cuda:0")
+pt.safetensors.save(model.state_dict(), "out.safetensors")
+state = pt.load_torch("model.pt")        # no torch needed; a restricted unpickler never runs code
+```
+
+- **DLPack:** float32 CPU tensors are shared with no copy; other dtypes (f16, bf16, f64, ints, bool) and
+  strided views are converted with one copy. A producer on another device (for example PyTorch XPU) is
+  asked to copy to the CPU first. Exporting a tensor that lives on a GPU raises a clear error telling you to
+  `.to("cpu:0")` first: zero-copy GPU sharing needs a pointer-export hook in the plugin ABI (planned).
+- **Checkpoints:** `Linear.weight` is exported as `[out, in]` like `torch.nn.Linear`, and `Sequential`
+  children are keyed by index (`0.weight`, `2.bias`). A PyTorch `nn.Sequential(Linear, ReLU, Linear)` checkpoint
+  loads into `pt.nn.mlp` and produces the same outputs, on every device.
+- **`torch.save` files** are read with an allow-list unpickler: only tensors, dicts and plain values are
+  accepted, so a malicious checkpoint is rejected rather than executed (this is tested).
+
 ## See it work
 
 `python examples/demo.py` runs the same script on whatever hardware it finds. These numbers are from a
@@ -188,6 +221,21 @@ That run then trains an 805M-parameter, 12-layer MLP on the Arc (about 2 s per s
 doesn't fit the RTX's free memory. The speed column comes from a short matmul benchmark run through
 each plugin, so it reflects what that plugin can actually do on this machine. See
 [examples/demo.py](examples/demo.py); `--dry-run` prints only the placement decisions.
+
+## Performance, honestly
+
+Against PyTorch 2.13 on the same laptop (full table and methodology in [benchmarks/](benchmarks/README.md)):
+
+| | matmul 4096² | elementwise add | MLP train step |
+|---|---|---|---|
+| **CUDA** (RTX PRO 1000) | 0.71x | **1.01x** | 0.54x |
+| **Intel Arc** | 0.26x | 0.19x | 0.26x |
+| **CPU** | 0.04x | 0.13x | 0.11x |
+
+(`PyTorch time / PyTorches time`: above 1.00x we're faster.) PyTorches is slower almost everywhere: it
+matches PyTorch on memory-bound CUDA ops and trails on compute-bound ones, because the kernels are simple
+and untuned. The CPU plugin is single-threaded and the Arc plugin has no caching allocator yet. None of that
+is architectural: each gap is closed inside one plugin, which is the point of the design.
 
 ## Correctness first
 
@@ -248,6 +296,8 @@ matmul is tiled but untuned, there is no fusion), and the op set is small.
 - Failures are ordinary Python exceptions: `MemoryError`, `ValueError`, `RuntimeError`
 - `pt.doctor()` hardware report; minimal `nn` (Linear, ReLU, Sequential, MSE) and SGD
 - Differential tests against PyTorch on every detected device
+- **PyTorch interop:** DLPack (zero-copy on CPU), safetensors, PyTorch-layout `state_dict`, and reading
+  `torch.save` checkpoints without torch
 
 **Known limits**
 
@@ -262,7 +312,8 @@ matmul is tiled but untuned, there is no fusion), and the op set is small.
 - [x] Intel GPU plugin (OpenCL for now; Level Zero / SPIR-V later)
 - [x] Memory-aware device choice (whole-model placement)
 - [ ] ROCm plugin
-- [ ] DLPack zero-copy exchange with `torch.Tensor`; `safetensors` and `state_dict` loading
+- [x] DLPack exchange with `torch.Tensor`; `safetensors` and `state_dict` loading
+- [ ] Zero-copy DLPack for GPU tensors (needs a pointer-export hook in the plugin ABI)
 - [ ] Splitting a model across devices, with spill/offload and transfer cost in the planner
 - [x] Clean out-of-memory errors (`MemoryError`) and fallback to the next device (`pt.place`)
 - [ ] Streams/async in the ABI

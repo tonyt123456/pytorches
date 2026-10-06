@@ -62,12 +62,12 @@ Fix the cracks now, while there is one backend. These get more expensive with ev
 
 ## Phase 2: Interop with PyTorch
 
-- [ ] **DLPack** export/import (`__dlpack__`, `__dlpack_device__`, `pt.from_dlpack`): zero-copy with `torch.Tensor` on CPU (P0)
-- [ ] DLPack for CUDA / XPU device memory (needs plugin hooks to export device pointers and sync)
-- [ ] `safetensors` read/write
-- [ ] Load PyTorch `.pt` `state_dict`s via a restricted unpickler (no arbitrary code execution)
-- [ ] Parameter/module naming identical to PyTorch so weights load with no remapping
-- [ ] `pt.from_torch(t)` / `t.to_torch()` convenience helpers
+- [x] **DLPack** export/import (`__dlpack__`, `__dlpack_device__`, `pt.from_dlpack`): zero-copy with `torch.Tensor` on CPU (P0)
+- [ ] DLPack for CUDA / XPU device memory (needs plugin hooks to export device pointers and sync). Today GPU tensors export through `.to("cpu:0")`, and CPU/XPU producers import via a host copy
+- [x] `safetensors` read/write
+- [x] Load PyTorch `.pt` `state_dict`s via a restricted unpickler (no arbitrary code execution)
+- [x] Parameter/module naming identical to PyTorch so weights load with no remapping
+- [x] `pt.from_torch(t)` / `t.to_torch()` convenience helpers
 - [ ] Import `torch.export` / FX graphs or ONNX → PyTorches ops (run existing models without rewriting)
 - [ ] **Compatibility target:** `import pytorches as torch` works for a defined subset. Publish the exact list of supported APIs and keep it in `docs/compat.md`
 - [ ] Differential-test harness extended to modules and full models (MLP, small CNN, tiny transformer)
@@ -230,3 +230,15 @@ Found while building and testing the CUDA and Intel Arc plugins and the demo.
 - [ ] Arc plugin env overrides (`PYTORCHES_XPU_VERBOSE`, `_ALLOC=host`, `_BUILD_OPTS`) documented in the plugin guide
 - [ ] Planner: model-aware estimates (today `estimate_mlp_training_bytes` is MLP-only)
 - [ ] `pt.doctor()`: report driver versions and why a plugin was skipped in more detail
+
+## Performance gaps measured against PyTorch 2.13 (2026-10-06; see benchmarks/README.md)
+
+Ordered by payoff.
+
+- [ ] **CPU plugin: threading + SIMD + blocked matmul.** 10-50x behind MKL (matmul 22 vs 611 GFLOP/s, sum 1.8 vs 88 GB/s). Start with rayon over rows/chunks and a packed, vectorized matmul.
+- [ ] **Intel plugin: caching allocator.** `add` on 64M floats runs at 17 GB/s vs PyTorch's 91 GB/s mostly because each call creates and commits a fresh 256 MB buffer. Reuse freed buffers by size, like the CUDA plugin does.
+- [ ] **Intel plugin: matmul on the matrix engines** (DPAS / `cl_intel_subgroup_matrix_multiply_accumulate`, or Level Zero + oneDNN). 1.0 vs ~4 TFLOP/s today.
+- [ ] **CUDA plugin: matmul tuning.** 3.3-3.7 vs cuBLAS 5.2-6.1 TFLOP/s (fp32). Try larger micro-tiles, double-buffered shared memory, vectorized loads; consider calling cuBLAS when present. Add an opt-in TF32 / bf16 tensor-core path (PyTorch reaches ~8.5 TFLOP/s with TF32).
+- [ ] CUDA `sum`: 239 vs 271 GB/s (0.88x), tune the reduction.
+- [ ] MLP step on CUDA is 0.54x: besides matmul, look at per-op overhead (every op allocates and launches separately; no fusion, no CUDA graphs) and the transposed-weight copies in backward.
+- [ ] Benchmarks: add a regression guard (track numbers per commit), and extend workloads (attention-shaped matmuls, softmax, layernorm) once those ops exist.
