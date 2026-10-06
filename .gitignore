@@ -5,3 +5,4 @@ __pycache__/
 *.so
 /plugins/bin/*
 !/plugins/bin/.gitkeep
+*.pdb
