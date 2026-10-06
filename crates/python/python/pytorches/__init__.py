@@ -28,6 +28,7 @@ from ._native import (  # noqa: E402,F401
     calibrate,
     device_info,
     devices,
+    from_dlpack,
     full,
     load_plugins,
     plugin_report,
@@ -35,7 +36,8 @@ from ._native import (  # noqa: E402,F401
     synchronize,
 )
 from ._report import Plan, doctor, plan, place  # noqa: E402,F401
-from . import nn, optim  # noqa: E402,F401
+from . import nn, optim, safetensors  # noqa: E402,F401
+from .torch_io import from_torch, from_torch_state_dict, load_torch, to_torch  # noqa: E402,F401
 
 
 def zeros(shape, device=None, requires_grad=False):
@@ -47,6 +49,7 @@ def ones(shape, device=None, requires_grad=False):
 
 
 __all__ = [
-    "Tensor", "randn", "zeros", "ones", "full", "devices", "device_info", "load_plugins",
-    "synchronize", "calibrate", "plan", "place", "Plan", "doctor", "nn", "optim",
+    "Tensor", "from_dlpack", "randn", "zeros", "ones", "full", "devices", "device_info", "load_plugins",
+    "synchronize", "calibrate", "plan", "place", "Plan", "doctor", "nn", "optim", "safetensors",
+    "from_torch", "to_torch", "from_torch_state_dict", "load_torch",
 ]

@@ -195,6 +195,9 @@ impl fmt::Debug for Device {
 struct Buffer {
     device: Device,
     ptr: *mut c_void,
+    /// Set for memory owned by someone else (e.g. a DLPack producer); runs instead of the
+    /// plugin's `free` when the last reference to the buffer is dropped.
+    foreign: Option<Box<dyn FnOnce() + Send>>,
 }
 
 // The pointer is opaque and only ever used via thread-safe plugin entry points.
@@ -207,14 +210,24 @@ impl Buffer {
         let bytes = (numel * 4).max(4);
         let status = unsafe { (device.plugin.vt.alloc)(device.index, bytes, &mut ptr) };
         check(status, &device.plugin, || format!("alloc of {bytes} bytes on {device} failed"));
-        Buffer { device: device.clone(), ptr }
+        Buffer { device: device.clone(), ptr, foreign: None }
     }
 }
 
 impl Drop for Buffer {
     fn drop(&mut self) {
-        unsafe { (self.device.plugin.vt.free)(self.device.index, self.ptr) };
+        match self.foreign.take() {
+            Some(release) => release(),
+            None => unsafe { (self.device.plugin.vt.free)(self.device.index, self.ptr) },
+        }
     }
+}
+
+/// Host memory of a CPU tensor, plus a guard that keeps it alive. See [`Tensor::host_export`].
+pub struct HostExport {
+    pub ptr: *mut c_void,
+    /// Drop this when the consumer is done with `ptr`.
+    pub keepalive: Box<dyn std::any::Any + Send + Sync>,
 }
 
 // ---- tensor ---------------------------------------------------------------------
@@ -384,6 +397,45 @@ impl Tensor {
     /// (up to float rounding in `ln`/`cos`).
     pub fn randn_on(shape: &[usize], seed: u64, device: &Device) -> Self {
         run_op(device, op::RAND_NORMAL, [seed as i64, 0, 0, 0], &[], shape)
+    }
+
+    /// Wraps host `f32` memory owned by someone else (zero copy) as a CPU tensor.
+    ///
+    /// `release` runs when the last reference to the tensor's storage is dropped. If the pointer is
+    /// null or not 4-byte aligned, or the tensor is empty, the data is copied instead and `release`
+    /// runs immediately.
+    ///
+    /// # Safety
+    /// `ptr` must point to `shape.iter().product()` valid, contiguous `f32`s that stay valid and are
+    /// not freed until `release` runs.
+    pub unsafe fn from_host_borrowed(
+        ptr: *mut f32,
+        shape: Vec<usize>,
+        release: impl FnOnce() + Send + 'static,
+    ) -> Tensor {
+        let device = Device::parse("cpu").unwrap_or_else(|e| raise(Error::Invalid(e)));
+        let numel: usize = shape.iter().product();
+        if ptr.is_null() || numel == 0 || (ptr as usize) % std::mem::align_of::<f32>() != 0 {
+            let data = if numel == 0 || ptr.is_null() {
+                Vec::new()
+            } else {
+                unsafe { std::slice::from_raw_parts(ptr, numel) }.to_vec()
+            };
+            release();
+            return Tensor::from_vec_on(data, shape, &device);
+        }
+        let buf = Buffer { device, ptr: ptr as *mut c_void, foreign: Some(Box::new(release)) };
+        Self::build(Arc::new(buf), shape, false, None)
+    }
+
+    /// For CPU tensors: the host pointer of the (contiguous, row-major) data plus a guard keeping
+    /// it alive, enabling zero-copy hand-off. `None` for tensors on other devices.
+    pub fn host_export(&self) -> Option<HostExport> {
+        let buf = &self.0.data;
+        if buf.device.info().kind != abi::KIND_CPU {
+            return None;
+        }
+        Some(HostExport { ptr: buf.ptr, keepalive: Box::new(buf.clone()) })
     }
 
     /// A leaf tensor sharing this tensor's storage with the given `requires_grad`.
@@ -851,6 +903,33 @@ mod tests {
         }
         // and the library still works afterwards
         assert_eq!(try_run(|| Tensor::ones_on(&[2], &dev).to_vec()).unwrap(), vec![1.0, 1.0]);
+    }
+
+    #[test]
+    fn borrowed_host_memory_is_zero_copy_and_released() {
+        init();
+        use std::sync::atomic::{AtomicBool, Ordering};
+        let mut data = vec![1.0f32, 2.0, 3.0, 4.0];
+        let released = Arc::new(AtomicBool::new(false));
+        let flag = released.clone();
+        let t = unsafe { Tensor::from_host_borrowed(data.as_mut_ptr(), vec![2, 2], move || flag.store(true, Ordering::SeqCst)) };
+        assert_eq!(t.to_vec(), vec![1.0, 2.0, 3.0, 4.0]);
+        data[0] = 9.0; // visible through the tensor: no copy was made
+        assert_eq!(t.to_vec()[0], 9.0);
+        assert_eq!((&t + &t).to_vec(), vec![18.0, 4.0, 6.0, 8.0]);
+        assert!(!released.load(Ordering::SeqCst));
+        drop(t);
+        assert!(released.load(Ordering::SeqCst));
+    }
+
+    #[test]
+    fn host_export_keeps_storage_alive() {
+        init();
+        let t = Tensor::new(vec![5.0, 6.0], vec![2]);
+        let export = t.host_export().expect("cpu tensor exports");
+        drop(t);
+        let vals = unsafe { std::slice::from_raw_parts(export.ptr as *const f32, 2) };
+        assert_eq!(vals, &[5.0, 6.0]);
     }
 
     #[test]

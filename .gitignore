@@ -1,5 +1,5 @@
 /target
-/.venv
+/.venv*
 __pycache__/
 *.pyd
 *.so

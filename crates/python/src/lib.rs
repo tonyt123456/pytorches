@@ -1,9 +1,13 @@
 //! Native half of the Python package (`pytorches._native`); the public API lives in
 //! `python/pytorches/`.
 
-use pyo3::exceptions::{PyMemoryError, PyRuntimeError, PyTypeError, PyValueError};
+mod convert;
+mod dlpack;
+
+use pyo3::buffer::PyBuffer;
+use pyo3::exceptions::{PyBufferError, PyMemoryError, PyRuntimeError, PyTypeError, PyValueError};
 use pyo3::prelude::*;
-use pyo3::types::PyDict;
+use pyo3::types::{PyBytes, PyDict};
 use pytorches_core::{Device, Error, Tensor, plan, plugin, try_run};
 
 #[pyclass(name = "Tensor", module = "pytorches")]
@@ -188,6 +192,48 @@ impl PyTensor {
         guard(|| PyTensor(self.0.reshape(&shape)))
     }
 
+    /// DLPack export (zero-copy for CPU tensors). Only `copy` and `dl_device` are acted on:
+    /// the CPU needs no stream synchronization.
+    #[pyo3(signature = (stream=None, max_version=None, dl_device=None, copy=None))]
+    fn __dlpack__<'py>(
+        &self,
+        py: Python<'py>,
+        stream: Option<Bound<'py, PyAny>>,
+        max_version: Option<Bound<'py, PyAny>>,
+        dl_device: Option<(i32, i32)>,
+        copy: Option<bool>,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        let _ = (stream, max_version);
+        if let Some(d) = dl_device {
+            if d != (1, 0) {
+                return Err(PyBufferError::new_err(format!(
+                    "can only export to the CPU (DLPack device (1, 0)), asked for {d:?}"
+                )));
+            }
+        }
+        let t = if copy == Some(true) {
+            guard(|| {
+                let dev = Device::parse("cpu").expect("cpu plugin");
+                Tensor::from_vec_on(self.0.to_vec(), self.0.shape().to_vec(), &dev)
+            })?
+        } else {
+            self.0.clone()
+        };
+        dlpack::export(py, &t)
+    }
+
+    fn __dlpack_device__(&self) -> PyResult<(i32, i32)> {
+        let on_cpu = guard(|| self.0.host_export().is_some())?;
+        if on_cpu {
+            Ok((1, 0))
+        } else {
+            Err(PyBufferError::new_err(format!(
+                "tensor is on {}; DLPack export is zero-copy for CPU tensors only. Use t.to('cpu:0') first",
+                self.0.device()
+            )))
+        }
+    }
+
     fn __repr__(&self) -> PyResult<String> {
         guard(|| format!("{:?}", self.0))
     }
@@ -304,6 +350,54 @@ fn plan_placement<'py>(py: Python<'py>, required_bytes: u64) -> PyResult<Bound<'
     Ok(out)
 }
 
+/// Imports any object implementing `__dlpack__` (torch, numpy, jax, ...) as a CPU tensor.
+/// Zero-copy for contiguous float32 CPU producers; other dtypes/layouts are converted with one copy.
+#[pyfunction]
+fn from_dlpack(py: Python<'_>, obj: &Bound<'_, PyAny>) -> PyResult<PyTensor> {
+    Ok(PyTensor(dlpack::import(py, obj)?))
+}
+
+/// Builds a float32 tensor from raw little-endian bytes of the given safetensors dtype
+/// (`"F32"`, `"F16"`, `"BF16"`, `"I64"`, ...), widening to float32.
+#[pyfunction]
+#[pyo3(signature = (buffer, dtype, shape, device=None))]
+fn tensor_from_buffer(buffer: PyBuffer<u8>, dtype: &str, shape: Vec<usize>, device: Option<&str>) -> PyResult<PyTensor> {
+    let elem = convert::Elem::from_safetensors(dtype)
+        .ok_or_else(|| PyValueError::new_err(format!("unsupported safetensors dtype '{dtype}'")))?;
+    if !buffer.is_c_contiguous() {
+        return Err(PyBufferError::new_err("buffer must be C-contiguous"));
+    }
+    let n: usize = shape.iter().product();
+    if buffer.len_bytes() != n * elem.size() {
+        return Err(PyValueError::new_err(format!(
+            "buffer has {} bytes, shape {shape:?} of {dtype} needs {}",
+            buffer.len_bytes(),
+            n * elem.size()
+        )));
+    }
+    let dev = dev_or_default(device)?;
+    let base = buffer.buf_ptr() as *const u8;
+    let mut data = vec![0.0f32; n];
+    unsafe {
+        if elem == convert::Elem::F32 {
+            std::ptr::copy_nonoverlapping(base, data.as_mut_ptr() as *mut u8, n * 4);
+        } else {
+            for (i, v) in data.iter_mut().enumerate() {
+                *v = elem.read(base.add(i * elem.size()));
+            }
+        }
+    }
+    guard(|| PyTensor(Tensor::from_vec_on(data, shape, &dev)))
+}
+
+/// The tensor's data as little-endian float32 bytes.
+#[pyfunction]
+fn tensor_to_bytes<'py>(py: Python<'py>, t: &PyTensor) -> PyResult<Bound<'py, PyBytes>> {
+    let data = guard(|| t.0.to_vec())?;
+    let bytes: Vec<u8> = data.iter().flat_map(|v| v.to_le_bytes()).collect();
+    Ok(PyBytes::new(py, &bytes))
+}
+
 #[pymodule]
 fn _native(m: &Bound<'_, PyModule>) -> PyResult<()> {
     // Auto-discover plugins ($PYTORCHES_PLUGIN_DIR, set by the package; else ./plugins/bin).
@@ -312,6 +406,9 @@ fn _native(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(randn, m)?)?;
     m.add_function(wrap_pyfunction!(full, m)?)?;
     m.add_function(wrap_pyfunction!(synchronize, m)?)?;
+    m.add_function(wrap_pyfunction!(from_dlpack, m)?)?;
+    m.add_function(wrap_pyfunction!(tensor_from_buffer, m)?)?;
+    m.add_function(wrap_pyfunction!(tensor_to_bytes, m)?)?;
     m.add_function(wrap_pyfunction!(calibrate, m)?)?;
     m.add_function(wrap_pyfunction!(plugin_report, m)?)?;
     m.add_function(wrap_pyfunction!(plan_placement, m)?)?;
