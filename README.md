@@ -27,6 +27,9 @@ PyTorches turns that around:
 - **The core knows nothing about hardware.** It owns tensors, autograd and dispatch. That's it.
 - **Backends are plugins.** A plugin is a shared library behind a small, stable C ABI. Drop
   `pytorches_plugin_cuda.dll` into `plugins/` and the CUDA devices appear. No core rebuild.
+- **The plugins pick themselves.** The core has no hardware knowledge and no list of vendors.
+  It loads the plugins it finds, and each plugin runs its own hardware test. Only plugins that
+  find usable devices stay loaded, so one plugin folder works on any machine.
 - **Different people can own different backends.** NVIDIA, AMD and Intel plugins can live in
   separate repos with separate release cycles. They only depend on one tiny `#![no_std]` crate
   (or a header, since C and C++ plugins work too).
@@ -51,6 +54,20 @@ PyTorches turns that around:
         └───────────────┘  └───────────────┘  └───────────────┘
 ```
 
+**How plugins get selected**
+
+1. At startup the core scans the plugin directory for `pytorches_plugin_*` libraries.
+2. It loads each one and checks the ABI version.
+3. It calls the plugin's `device_count()`. That call is the **hardware test**, and the plugin
+   owns it: a CUDA plugin asks the NVIDIA driver, an Intel plugin asks Level Zero, and so on.
+4. A plugin that reports zero devices (no hardware, no driver, wrong generation) is
+   **unloaded and ignored**. A plugin that reports devices is registered, and its devices
+   show up as `cuda:0`, `xpu:0`, and so on.
+
+So the same plugin folder can ship to a machine with an NVIDIA GPU, one with an Arc GPU, or
+neither, and each machine ends up with only the backends it can actually use. Because the
+core never inspects hardware itself, supporting a new accelerator never touches the core.
+
 **How a plugin works**
 
 - It exports one symbol, `pytorches_plugin_entry`, returning a static vtable: device
@@ -59,7 +76,7 @@ PyTorches turns that around:
 - Operands arrive as **strided descriptors**. Broadcasting is stride 0 and transposing is a
   strided copy, so backends never implement "broadcast" or "transpose" as special cases.
 - The ABI version is checked before anything else. A plugin built for a different ABI is
-  rejected with a clear message, and one that finds no hardware is skipped silently.
+  rejected with a clear message, and one whose hardware test finds nothing is skipped silently.
 - `execute` returns a status code. Nothing Rust-specific (no `Vec`, `String`, `Box`)
   crosses the boundary.
 
