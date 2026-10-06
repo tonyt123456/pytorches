@@ -102,47 +102,97 @@ python -m venv .venv --system-site-packages
 cd crates\python; ..\..\.venv\Scripts\maturin develop --release; cd ..\..
 ```
 
-Then fit a line with autograd:
+Then train a small MLP. Nothing in the script names a device:
 
 ```python
 import pytorches as pt
 
-print(pt.devices())                 # ['cpu:0'] + whatever plugins are in plugins/bin
+pt.doctor()                                   # what was found, which backends loaded
 
-xs = [i / 10 for i in range(20)]
-x = pt.Tensor(xs, [20, 1])
-y = pt.Tensor([3 * v + 1 for v in xs], [20, 1])      # target: y = 3x + 1
+model = pt.nn.mlp([64, 256, 256, 1])          # Linear -> ReLU stack
+x, y = pt.randn([128, 64], seed=1), pt.randn([128, 1], seed=2)
+opt = pt.optim.SGD(model.parameters(), lr=0.01)
 
-w = pt.Tensor([0.0], [1, 1], requires_grad=True)
-b = pt.Tensor([0.0], [1], requires_grad=True)
-
-for _ in range(300):
-    w.zero_grad(); b.zero_grad()
-    err = x @ w + b - y
-    loss = (err * err).mean()
+for step in range(20):
+    opt.zero_grad()
+    loss = pt.nn.mse_loss(model(x), y)
     loss.backward()
-    # no optimizers yet: take the step by hand and re-wrap as fresh leaves
-    w = pt.Tensor((w - 0.1 * w.grad).tolist(), [1, 1], requires_grad=True)
-    b = pt.Tensor((b - 0.1 * b.grad).tolist(), [1], requires_grad=True)
-
-print(w.item(), b.item())           # ≈ 3.000, 1.000
+    opt.step()
+print(loss.item())
 ```
 
-Move work between devices; the move is differentiable:
+Let PyTorches pick the device for a workload, and ask it to explain the choice:
+
+```python
+need = pt.nn.estimate_mlp_training_bytes([8192] * 13, batch=32)
+plan = pt.plan(need)                          # profiles devices, checks free memory
+print(plan)                                   # table + the reason
+model = pt.nn.mlp([8192] * 13, device=plan.device)
+```
+
+Tensors can also be moved explicitly, and the move is differentiable:
 
 ```python
 t = pt.Tensor([1.0, 2.0], [2], device="cpu:0")
-t.to("cuda:0")                      # available once the CUDA backend lands (planned)
+t.to("cuda:0")                                # any device from pt.devices()
 ```
 
 *Advanced:* plugins are found in `$PYTORCHES_PLUGIN_DIR`, else `./plugins/bin`, else
 `<exe dir>/plugins`. Only files named `pytorches_plugin_*` are considered.
 
+## See it work
+
+`python examples/demo.py` runs the same script on whatever hardware it finds. These numbers are from a
+laptop with an 8 GB NVIDIA RTX PRO 1000 (Blackwell) and an Intel Arc 140T iGPU that borrows system memory.
+
+**1. Detection.** Each plugin ran its own hardware test; all three found devices:
+
+```
+plugins:
+  loaded   cpu    (pytorches_plugin_cpu.dll)
+  loaded   cuda   (pytorches_plugin_cuda.dll)
+  loaded   xpu    (pytorches_plugin_xpu.dll)
+
+devices:
+  cpu:0    cpu                                      51.4 GiB free / 63.4 GiB  31.2 GFLOP/s
+  cuda:0   NVIDIA RTX PRO 1000 Blackwell ...         6.9 GiB free / 8.0 GiB    2.87 TFLOP/s
+  xpu:0    Intel(R) Arc(TM) 140T GPU (32GB)         33.5 GiB free / 33.5 GiB  964.9 GFLOP/s
+```
+
+**2. The same script on every device** (a 4-layer, 2048-wide MLP, batch 256, one training step):
+
+| device | time per step |
+|---|---|
+| `cpu:0` (naive reference kernels) | 1,930 ms |
+| `xpu:0` (Intel Arc 140T) | 38 ms |
+| `cuda:0` (RTX PRO 1000) | 9.5 ms |
+
+**3. Placement.** A model that fits the fast GPU goes there. One that doesn't goes to the
+big-memory device, and the planner says why:
+
+```
+Placement plan: workload needs ~6.5 GiB
+
+  device   name                               free / total         speed          fits
+  cuda:0   NVIDIA RTX PRO 1000 Blackwell Gene 6.9 GiB / 8.0 GiB    2.87 TFLOP/s   no
+  xpu:0    Intel(R) Arc(TM) 140T GPU (32GB)   33.5 GiB / 33.5 GiB  964.9 GFLOP/s  yes  <- chosen
+  cpu:0    cpu                                50.1 GiB / 63.4 GiB  31.2 GFLOP/s   yes
+
+  -> xpu:0: needs 6.5 GiB; the fastest device (cuda:0) has only 6.9 GiB free, so fall back to xpu:0
+```
+
+That run then trains an 805M-parameter, 12-layer MLP on the Arc (about 2 s per step), a model that
+doesn't fit the RTX's free memory. The speed column comes from a short matmul benchmark run through
+each plugin, so it reflects what that plugin can actually do on this machine. See
+[examples/demo.py](examples/demo.py); `--dry-run` prints only the placement decisions.
+
 ## Correctness first
 
 Every op is checked against PyTorch itself. `tests/diff` runs each op in both libraries on
-random inputs (including broadcasting shapes) and compares the **forward values and the
-gradients**. A new backend inherits that oracle for free.
+random inputs (including broadcasting shapes), **on every device it detects**, and compares the
+forward values and the gradients. A new backend inherits that oracle for free. The suite also
+checks the cross-device RNG, in-place updates, device moves, placement, and that a small training
+run reduces its loss.
 
 ```powershell
 .venv\Scripts\python -m unittest discover -s tests\diff -v
@@ -170,35 +220,50 @@ ABI evolution: ops are append-only. A layout change bumps `ABI_VERSION`.
 |---|---|
 | `crates/plugin-abi` | The stable plugin ABI. The only crate a plugin author needs. |
 | `crates/core` | `Tensor`, reverse-mode autograd, device registry, plugin loader. |
-| `crates/python` | PyO3 bindings, built with maturin. |
-| `plugins/<name>` | One crate per backend. `cpu` is the reference. |
+| `crates/python` | PyO3 bindings plus the Python package (`nn`, `optim`, `doctor`, `plan`), built with maturin. |
+| `plugins/cpu` | Reference backend. |
+| `plugins/cuda` | NVIDIA via the CUDA driver API (`nvcuda.dll`), with committed PTX kernels. Needs only the driver. |
+| `plugins/xpu` | Intel GPUs via the OpenCL runtime in the Intel graphics driver. |
 | `plugins/bin` | Built plugin libraries; the runtime scans this directory. |
 | `tests/diff` | Differential tests against PyTorch. |
+| `examples/` | The demo. |
 
 ## Status and roadmap
 
-PyTorches is **early alpha**. It is not a PyTorch replacement yet, and it is not fast yet.
-The CPU plugin is a naive reference implementation.
+PyTorches is **early alpha**. It is not a PyTorch replacement yet. The kernels are simple (the
+matmul is tiled but untuned, there is no fusion), and the op set is small.
 
 **Working today**
 
 - `f32` tensors; add/sub/mul/div with broadcasting; neg, exp, log, relu, tanh
-- sum, mean, 2-D matmul, transpose, reshape
-- Reverse-mode autograd (gradient accumulation, shared subexpressions, broadcast reduction)
-- Runtime plugin loading, device enumeration, differentiable cross-device `.to()`
-- Python bindings and a differential test suite against PyTorch
+- sum, mean, 2-D matmul, transpose, reshape; reverse-mode autograd
+- **Three backends as plugins:** CPU (reference), NVIDIA CUDA, Intel GPU (OpenCL)
+- Automatic plugin selection by each plugin's own hardware test
+- Device-side tensor creation (constants and a cross-device-reproducible `randn`), in-place updates
+- Automatic placement: `pt.plan()` profiles devices and picks one by speed and free memory
+- `pt.doctor()` hardware report; minimal `nn` (Linear, ReLU, Sequential, MSE) and SGD
+- Differential tests against PyTorch on every detected device
+
+**Known limits**
+
+- A tensor must live wholly on one device; a model that fits no single device can't be split yet.
+- Free memory on the Intel iGPU is an estimate (OpenCL has no free-memory query), and it shares
+  system RAM, so a plan can be optimistic when RAM is tight.
+- Running out of device memory currently aborts the Python call with a panic instead of a clean error.
+- Only `f32`, contiguous tensors, 2-D matmul.
 
 **Next**
 
-- [ ] CUDA plugin (NVIDIA, targeting current toolkits and Blackwell via PTX JIT)
-- [ ] Intel Arc plugin (Level Zero / SPIR-V)
+- [x] CUDA plugin (NVIDIA, current toolkits; Blackwell via PTX JIT)
+- [x] Intel GPU plugin (OpenCL for now; Level Zero / SPIR-V later)
+- [x] Memory-aware device choice (whole-model placement)
 - [ ] ROCm plugin
 - [ ] DLPack zero-copy exchange with `torch.Tensor`; `safetensors` and `state_dict` loading
-- [ ] Memory-aware placement: run what fits on the fast GPU, spill or offload the rest to the big
-  one, with transfer cost in the model
-- [ ] Strided views, more dtypes (f16/bf16/i64), more ops, `nn` and optimizers
+- [ ] Splitting a model across devices, with spill/offload and transfer cost in the planner
+- [ ] Clean out-of-memory errors; streams/async in the ABI
+- [ ] Strided views, more dtypes (f16/bf16/i64), more ops, a fuller `nn`, more optimizers
 - [ ] Fusion and tuned matmul/attention kernels
-- [ ] Hardware detection plus on-demand plugin download
+- [ ] Bundled plugins in the Python wheel, plus on-demand plugin download
 - [ ] Intel NPU plugin (inference only: static-shape graphs)
 
 **Non-goals (for now):** matching PyTorch's 2,000+ ops, or supporting old GPU generations.

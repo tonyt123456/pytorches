@@ -1,9 +1,10 @@
-//! Python bindings: `import pytorches`.
+//! Native half of the Python package (`pytorches._native`); the public API lives in
+//! `python/pytorches/`.
 
 use pyo3::exceptions::{PyRuntimeError, PyTypeError, PyValueError};
 use pyo3::prelude::*;
 use pyo3::types::PyDict;
-use pytorches_core::{Device, Tensor, plugin};
+use pytorches_core::{Device, Tensor, plan, plugin};
 
 #[pyclass(name = "Tensor", module = "pytorches")]
 #[derive(Clone)]
@@ -43,6 +44,25 @@ impl PyTensor {
     #[getter]
     fn device(&self) -> String {
         self.0.device().to_string()
+    }
+
+    #[getter]
+    fn nbytes(&self) -> usize {
+        self.0.nbytes()
+    }
+
+    fn numel(&self) -> usize {
+        self.0.numel()
+    }
+
+    /// Returns a leaf sharing this tensor's storage with the given `requires_grad`.
+    fn requires_grad_(&self, flag: bool) -> PyTensor {
+        PyTensor(self.0.requires_grad_(flag))
+    }
+
+    /// In-place overwrite (shapes must match); not tracked by autograd.
+    fn copy_(&self, src: &PyTensor) {
+        self.0.copy_(&src.0)
     }
 
     fn to(&self, device: &str) -> PyResult<PyTensor> {
@@ -184,11 +204,92 @@ fn device_info<'py>(py: Python<'py>, device: &str) -> PyResult<Bound<'py, PyDict
     Ok(d)
 }
 
+fn dev_or_default(device: Option<&str>) -> PyResult<Device> {
+    match device {
+        Some(d) => parse_device(d),
+        None => Ok(Device::default_device()),
+    }
+}
+
+/// Tensor of N(0,1) samples generated on the device.
+#[pyfunction]
+#[pyo3(signature = (shape, device=None, seed=0, requires_grad=false))]
+fn randn(shape: Vec<usize>, device: Option<&str>, seed: u64, requires_grad: bool) -> PyResult<PyTensor> {
+    let t = Tensor::randn_on(&shape, seed, &dev_or_default(device)?);
+    Ok(PyTensor(t.requires_grad_(requires_grad)))
+}
+
+/// Constant-filled tensor created directly on the device.
+#[pyfunction]
+#[pyo3(signature = (shape, value, device=None, requires_grad=false))]
+fn full(shape: Vec<usize>, value: f32, device: Option<&str>, requires_grad: bool) -> PyResult<PyTensor> {
+    let t = Tensor::full_on(&shape, value, &dev_or_default(device)?);
+    Ok(PyTensor(t.requires_grad_(requires_grad)))
+}
+
+#[pyfunction]
+fn synchronize(device: &str) -> PyResult<()> {
+    parse_device(device)?.synchronize();
+    Ok(())
+}
+
+/// Measured matmul throughput of a device in GFLOP/s.
+#[pyfunction]
+fn calibrate(device: &str) -> PyResult<f64> {
+    Ok(plan::calibrate(&parse_device(device)?))
+}
+
+/// What plugin discovery tried at import: a list of `(file, loaded_plugin_name_or_None, error_or_None)`.
+#[pyfunction]
+fn plugin_report() -> Vec<(String, Option<String>, Option<String>)> {
+    plugin::discovery_report()
+        .into_iter()
+        .map(|(path, r)| {
+            let file = path.file_name().map(|f| f.to_string_lossy().into_owned()).unwrap_or_default();
+            match r {
+                Ok(name) => (file, Some(name), None),
+                Err(e) => (file, None, Some(e)),
+            }
+        })
+        .collect()
+}
+
+/// Picks a device for a workload needing `required_bytes`; returns a dict describing the decision.
+#[pyfunction]
+fn plan_placement<'py>(py: Python<'py>, required_bytes: u64) -> PyResult<Bound<'py, PyDict>> {
+    let p = plan::plan(required_bytes);
+    let out = PyDict::new(py);
+    out.set_item("required_bytes", p.required_bytes)?;
+    out.set_item("chosen", p.chosen.to_string())?;
+    out.set_item("reason", p.reason)?;
+    out.set_item("may_oom", p.may_oom)?;
+    let mut cands = Vec::new();
+    for c in p.candidates {
+        let d = PyDict::new(py);
+        d.set_item("device", c.device.to_string())?;
+        d.set_item("name", c.name)?;
+        d.set_item("kind", c.kind)?;
+        d.set_item("total_memory", c.total_memory)?;
+        d.set_item("free_memory", c.free_memory)?;
+        d.set_item("gflops", c.gflops)?;
+        d.set_item("fits", c.fits)?;
+        cands.push(d);
+    }
+    out.set_item("candidates", cands)?;
+    Ok(out)
+}
+
 #[pymodule]
-fn pytorches(m: &Bound<'_, PyModule>) -> PyResult<()> {
-    // Auto-discover plugins ($PYTORCHES_PLUGIN_DIR, else ./plugins/bin).
+fn _native(m: &Bound<'_, PyModule>) -> PyResult<()> {
+    // Auto-discover plugins ($PYTORCHES_PLUGIN_DIR, set by the package; else ./plugins/bin).
     plugin::discover();
     m.add_class::<PyTensor>()?;
+    m.add_function(wrap_pyfunction!(randn, m)?)?;
+    m.add_function(wrap_pyfunction!(full, m)?)?;
+    m.add_function(wrap_pyfunction!(synchronize, m)?)?;
+    m.add_function(wrap_pyfunction!(calibrate, m)?)?;
+    m.add_function(wrap_pyfunction!(plugin_report, m)?)?;
+    m.add_function(wrap_pyfunction!(plan_placement, m)?)?;
     m.add_function(wrap_pyfunction!(load_plugins, m)?)?;
     m.add_function(wrap_pyfunction!(devices, m)?)?;
     m.add_function(wrap_pyfunction!(device_info, m)?)?;
