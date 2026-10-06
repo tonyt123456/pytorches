@@ -1,0 +1,17 @@
+[package]
+name = "pytorches-plugin-xpu"
+description = "Intel GPU (OpenCL) plugin"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[lib]
+name = "pytorches_plugin_xpu"
+crate-type = ["cdylib"]
+
+[dependencies]
+pytorches-plugin-abi = { path = "../../crates/plugin-abi" }
+libloading = "0.8"
+
+[dev-dependencies]
+pytorches-core = { path = "../../crates/core" }

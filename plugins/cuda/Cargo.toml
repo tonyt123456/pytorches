@@ -1,0 +1,17 @@
+[package]
+name = "pytorches-plugin-cuda"
+description = "NVIDIA CUDA plugin (driver API loaded at runtime; no toolkit needed)"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[lib]
+name = "pytorches_plugin_cuda"
+crate-type = ["cdylib"]
+
+[dependencies]
+pytorches-plugin-abi = { path = "../../crates/plugin-abi" }
+libloading = "0.8"
+
+[dev-dependencies]
+pytorches-core = { path = "../../crates/core" }

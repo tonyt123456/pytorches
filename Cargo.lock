@@ -129,6 +129,24 @@ dependencies = [
 ]
 
 [[package]]
+name = "pytorches-plugin-cuda"
+version = "0.1.0"
+dependencies = [
+ "libloading",
+ "pytorches-core",
+ "pytorches-plugin-abi",
+]
+
+[[package]]
+name = "pytorches-plugin-xpu"
+version = "0.1.0"
+dependencies = [
+ "libloading",
+ "pytorches-core",
+ "pytorches-plugin-abi",
+]
+
+[[package]]
 name = "pytorches-python"
 version = "0.1.0"
 dependencies = [
