@@ -143,10 +143,41 @@ fn transpose_strided_copy() {
 #[test]
 fn matmul_sizes() {
     let d = need!();
-    for (m, k, n) in [(33, 65, 17), (1, 1, 1), (64, 16, 64), (65, 17, 65), (5, 300, 7), (128, 128, 128), (512, 512, 512), (3, 1000, 130)] {
+    for (m, k, n) in [
+        (33, 65, 17),
+        (1, 1, 1),
+        (64, 16, 64),
+        (65, 17, 65),
+        (5, 300, 7),
+        (128, 128, 128),
+        (512, 512, 512),
+        (3, 1000, 130),
+        // Sub-group fast path: smallest tile, a few tiles, a long K, and each dimension one off the
+        // tile size (those must fall back to the general kernel).
+        (16, 16, 32),
+        (48, 48, 96),
+        (32, 4096, 64),
+        (256, 2048, 64),
+        (16, 16, 31),
+        (17, 16, 32),
+        (16, 17, 32),
+        (16, 16, 33),
+    ] {
         let (ca, xa) = both(d, &[m, k], 3);
         let (cb, xb) = both(d, &[k, n], 4);
         assert_close(&xa.matmul(&xb).to_vec(), &ca.matmul(&cb).to_vec(), 2e-4, &format!("matmul {m}x{k}x{n}"));
+    }
+}
+
+#[test]
+fn axpy_in_place() {
+    let d = need!();
+    for n in [1usize, 255, 4097, 1 << 20] {
+        let (ca, xa) = both(d, &[n], 5);
+        let (cb, xb) = both(d, &[n], 6);
+        ca.axpy_(-0.25, &cb);
+        xa.axpy_(-0.25, &xb);
+        assert_close(&xa.to_vec(), &ca.to_vec(), 1e-6, &format!("axpy n={n}"));
     }
 }
 

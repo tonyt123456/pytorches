@@ -81,6 +81,11 @@ __kernel void binary_strided(__global const float* a, __global const float* b, _
         y[i] = bi(op, a[offs(i, &da, use32)], b[offs(i, &db, use32)]);
 }
 
+// y = a + alpha * b (fused update; y may alias a, so no restrict).
+__kernel void axpy(__global const float* a, __global const float* b, __global float* y, ulong n, float alpha) {
+    for (ulong i = get_global_id(0); i < n; i += get_global_size(0)) y[i] = a[i] + alpha * b[i];
+}
+
 __kernel void fill(__global float* y, ulong n, float v) {
     for (ulong i = get_global_id(0); i < n; i += get_global_size(0)) y[i] = v;
 }
@@ -160,6 +165,46 @@ void matmul(__global const float* A, __global const float* B, __global float* C,
         }
     }
 }
+
+// ---- matmul fast path: sub-group tiles, no local memory ---------------------------------------
+// Needs M % 16 == 0, N % 32 == 0, K % 16 == 0 (the host checks) and cl_intel_subgroups. A 16-lane
+// sub-group computes a 16 x 32 tile of C: lane j owns columns j and j+16 of every tile row. B rows are
+// fetched with one wide block read (lane j gets B[k][j] and B[k][j+16]); A[r][k0+lane] is loaded
+// coalesced and each element is broadcast to all lanes by sub_group_broadcast. About 2x the tiled
+// kernel above on an Arc 140T (2.3 vs 1.1 TFLOP/s); the fp32 peak measured on it is ~4.1.
+// Tried and not better: wider/narrower tiles, work-group sharing of B, tile-order swizzles, explicit
+// load prefetch (spills the 128-register file) and the 256-GRF mode (halves occupancy).
+#ifdef cl_intel_subgroups
+#pragma OPENCL EXTENSION cl_intel_subgroups : enable
+#define SG_TR 16
+#define SG_TC 2
+__kernel __attribute__((intel_reqd_sub_group_size(16)))
+void matmul_sg(__global const float* A, __global const float* B, __global float* C, ulong M, ulong N, ulong K) {
+    const uint lane = get_sub_group_local_id();
+    const ulong col0 = (ulong)(get_global_id(0) / 16) * (16 * SG_TC);
+    const ulong row0 = (ulong)get_global_id(1) * SG_TR;
+    float acc[SG_TR][SG_TC];
+    for (int r = 0; r < SG_TR; r++)
+        for (int c = 0; c < SG_TC; c++) acc[r][c] = 0.0f;
+    for (ulong k0 = 0; k0 < K; k0 += 16) {
+        float a[SG_TR];
+        for (int r = 0; r < SG_TR; r++) a[r] = A[(row0 + r) * K + k0 + lane];
+#pragma unroll
+        for (int kk = 0; kk < 16; kk++) {
+            const uint2 u = intel_sub_group_block_read2((__global const uint*)(B + (k0 + kk) * N + col0));
+            const float b0 = as_float(u.s0), b1 = as_float(u.s1);
+#pragma unroll
+            for (int r = 0; r < SG_TR; r++) {
+                const float av = sub_group_broadcast(a[r], kk);
+                acc[r][0] = mad(av, b0, acc[r][0]);
+                acc[r][1] = mad(av, b1, acc[r][1]);
+            }
+        }
+    }
+    for (int r = 0; r < SG_TR; r++)
+        for (int c = 0; c < SG_TC; c++) C[(row0 + r) * N + col0 + c * 16 + lane] = acc[r][c];
+}
+#endif
 
 // ---- sum over one axis of an (outer, n, inner) contiguous tensor -----------------------------
 // Partial results use the layout out[(o*inner+i)*splits + s]; when splits == 1 that is the

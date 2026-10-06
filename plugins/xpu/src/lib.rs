@@ -9,6 +9,11 @@
 //!   `CL_MEM_ALLOW_UNRESTRICTED_SIZE_INTEL`.
 //! * The `cl_mem` handle itself is the opaque device pointer handed to the core.
 //!
+//! * Freed buffers go to a per-device cache keyed by bucketed size and are reused by later allocations
+//!   (creating and committing a fresh multi-hundred-MiB buffer for every op was the main cost of
+//!   elementwise ops). The cache is flushed when an allocation fails, so it never turns a request
+//!   that would fit into an out-of-memory error.
+//!
 //! Environment knobs (all optional): `PYTORCHES_XPU_VERBOSE=1` prints device limits to stderr,
 //! `PYTORCHES_XPU_ALLOC=host` adds `CL_MEM_ALLOC_HOST_PTR` to every buffer,
 //! `PYTORCHES_XPU_BUILD_OPTS` replaces the kernel build options.
@@ -38,7 +43,6 @@ const CL_DEVICE_GLOBAL_MEM_SIZE: u32 = 0x101F;
 const CL_DEVICE_NAME: u32 = 0x102B;
 const CL_PLATFORM_NAME: u32 = 0x0902;
 const CL_PROGRAM_BUILD_LOG: u32 = 0x1183;
-const CL_MEM_SIZE: u32 = 0x1102;
 const CL_MEM_READ_WRITE: u64 = 1;
 const CL_MEM_ALLOC_HOST_PTR: u64 = 1 << 4;
 const CL_MEM_ALLOW_UNRESTRICTED_SIZE_INTEL: u64 = 1 << 23;
@@ -175,7 +179,6 @@ cl_api! {
     clEnqueueNDRangeKernel: unsafe extern "system" fn(H, H, u32, *const usize, *const usize, *const usize, u32, *const H, *mut H) -> i32,
     clCreateBuffer: unsafe extern "system" fn(H, u64, usize, *mut c_void, *mut i32) -> H,
     clReleaseMemObject: unsafe extern "system" fn(H) -> i32,
-    clGetMemObjectInfo: unsafe extern "system" fn(H, u32, usize, *mut c_void, *mut usize) -> i32,
     clEnqueueReadBuffer: unsafe extern "system" fn(H, H, u32, usize, usize, *mut c_void, u32, *const H, *mut H) -> i32,
     clEnqueueWriteBuffer: unsafe extern "system" fn(H, H, u32, usize, usize, *const c_void, u32, *const H, *mut H) -> i32,
     clEnqueueCopyBuffer: unsafe extern "system" fn(H, H, H, usize, usize, usize, u32, *const H, *mut H) -> i32,
@@ -190,6 +193,15 @@ struct State {
     scratch: H,
 }
 
+/// Reusable buffers. Handles are stored as `usize` so the cache is `Send`.
+#[derive(Default)]
+struct Cache {
+    free: HashMap<usize, Vec<usize>>,
+    /// Size of every live-or-cached buffer we created, by handle.
+    sizes: HashMap<usize, usize>,
+    cached_bytes: u64,
+}
+
 struct Dev {
     ctx: H,
     queue: H,
@@ -197,7 +209,9 @@ struct Dev {
     name: String,
     total: u64,
     max_alloc: u64,
+    /// Bytes of all buffers created and not yet released to the runtime (in use + cached).
     allocated: AtomicU64,
+    cache: Mutex<Cache>,
     host_ptr: bool,
     /// Serializes queue / kernel-argument access.
     state: Mutex<State>,
@@ -302,6 +316,7 @@ unsafe fn init() -> Option<Global> {
                     total,
                     max_alloc,
                     allocated: AtomicU64::new(0),
+                    cache: Mutex::new(Cache::default()),
                     host_ptr,
                     state: Mutex::new(State { kernels: None, scratch: null_mut() }),
                 });
@@ -328,14 +343,19 @@ fn lock(d: &Dev) -> std::sync::MutexGuard<'_, State> {
 
 // ---- program / kernels ----------------------------------------------------------------
 
+/// Kernels that exist only when the driver supports an extension they need; missing ones are skipped.
+const OPTIONAL_KERNELS: &[&str] = &["matmul_sg"];
+
 const KERNEL_NAMES: &[&str] = &[
     "unary_flat",
     "unary_strided",
     "binary_flat",
     "binary_strided",
+    "axpy",
     "fill",
     "rand_normal",
     "matmul",
+    "matmul_sg",
     "sum_rows",
     "sum_inner",
     "reduce_partials",
@@ -370,6 +390,9 @@ unsafe fn ensure_ready(g: &Global, d: &Dev, st: &mut State) -> R<()> {
         for &name in KERNEL_NAMES {
             let cname = CString::new(name).unwrap();
             let k = (g.cl.clCreateKernel)(prog, cname.as_ptr(), &mut e);
+            if e != 0 && OPTIONAL_KERNELS.contains(&name) {
+                continue;
+            }
             check(e, &format!("clCreateKernel({name})"))?;
             kernels.insert(name, k);
         }
@@ -441,13 +464,19 @@ unsafe fn launch(
 
 // ---- memory entry points --------------------------------------------------------------
 
-unsafe extern "C" fn alloc_buf(device: u32, bytes: usize, out: *mut *mut c_void) -> Status {
-    guard(|| unsafe {
-        let (g, d) = dev_of(device)?;
-        if out.is_null() {
-            return fail(STATUS_INVALID_ARGUMENT, "null out pointer");
-        }
-        let bytes = bytes.max(4);
+/// Rounds a request up so similar sizes share buffers: powers of two below 1 MiB, 2 MiB steps above.
+fn bucket(bytes: usize) -> usize {
+    const MIB: usize = 1 << 20;
+    if bytes < MIB { bytes.max(256).next_power_of_two() } else { bytes.div_ceil(2 * MIB) * 2 * MIB }
+}
+
+fn cache_lock(d: &Dev) -> std::sync::MutexGuard<'_, Cache> {
+    d.cache.lock().unwrap_or_else(|p| p.into_inner())
+}
+
+/// Creates a buffer of exactly `bytes`, or returns the OpenCL error code.
+unsafe fn create_buffer(g: &Global, d: &Dev, bytes: usize) -> Result<H, i32> {
+    unsafe {
         let mut base = CL_MEM_READ_WRITE;
         if d.host_ptr {
             base |= CL_MEM_ALLOC_HOST_PTR;
@@ -461,22 +490,72 @@ unsafe extern "C" fn alloc_buf(device: u32, bytes: usize, out: *mut *mut c_void)
             e = 0;
             mem = (g.cl.clCreateBuffer)(d.ctx, base | CL_MEM_ALLOW_UNRESTRICTED_SIZE_INTEL, bytes, null_mut(), &mut e);
         }
-        if mem.is_null() || e != 0 {
-            let status = if is_oom_code(e) || e == -61 { STATUS_OUT_OF_MEMORY } else { STATUS_INTERNAL };
-            return fail(
-                status,
-                format!(
-                    "clCreateBuffer({bytes} bytes) failed: {} ({e}); tracked allocations {} bytes, device total {} bytes, max single alloc {} bytes",
-                    cl_err_name(e),
-                    d.allocated.load(Ordering::Relaxed),
-                    d.total,
-                    d.max_alloc
-                ),
-            );
+        if mem.is_null() || e != 0 { Err(if e == 0 { -4 } else { e }) } else { Ok(mem) }
+    }
+}
+
+/// Returns every cached buffer to the runtime. The runtime defers destruction until queued work using
+/// a buffer has finished, so this is safe with kernels still in flight.
+unsafe fn flush_cache(g: &Global, d: &Dev, c: &mut Cache) {
+    unsafe {
+        for (size, handles) in c.free.drain() {
+            for h in handles {
+                (g.cl.clReleaseMemObject)(h as H);
+                c.sizes.remove(&h);
+                c.cached_bytes -= size as u64;
+                d.allocated.fetch_sub(size as u64, Ordering::Relaxed);
+            }
         }
-        d.allocated.fetch_add(bytes as u64, Ordering::Relaxed);
-        *out = mem;
-        Ok(())
+    }
+}
+
+unsafe extern "C" fn alloc_buf(device: u32, bytes: usize, out: *mut *mut c_void) -> Status {
+    guard(|| unsafe {
+        let (g, d) = dev_of(device)?;
+        if out.is_null() {
+            return fail(STATUS_INVALID_ARGUMENT, "null out pointer");
+        }
+        let bytes = bytes.max(4);
+        let size = bucket(bytes);
+        let mut c = cache_lock(d);
+        if let Some(h) = c.free.get_mut(&size).and_then(|v| v.pop()) {
+            c.cached_bytes -= size as u64;
+            *out = h as H;
+            return Ok(());
+        }
+        let mut got = size;
+        let mut res = create_buffer(g, d, size);
+        if res.is_err() {
+            // Out of memory (or a refused size): give the cache back and try again, then try the
+            // exact size without the bucket rounding.
+            flush_cache(g, d, &mut c);
+            res = create_buffer(g, d, size);
+            if res.is_err() && bytes < size {
+                got = bytes;
+                res = create_buffer(g, d, bytes);
+            }
+        }
+        match res {
+            Ok(mem) => {
+                c.sizes.insert(mem as usize, got);
+                d.allocated.fetch_add(got as u64, Ordering::Relaxed);
+                *out = mem;
+                Ok(())
+            }
+            Err(e) => {
+                let status = if is_oom_code(e) || e == -61 { STATUS_OUT_OF_MEMORY } else { STATUS_INTERNAL };
+                fail(
+                    status,
+                    format!(
+                        "clCreateBuffer({bytes} bytes) failed: {} ({e}); tracked allocations {} bytes, device total {} bytes, max single alloc {} bytes",
+                        cl_err_name(e),
+                        d.allocated.load(Ordering::Relaxed),
+                        d.total,
+                        d.max_alloc
+                    ),
+                )
+            }
+        }
     })
 }
 
@@ -484,15 +563,16 @@ unsafe extern "C" fn free_buf(device: u32, ptr: *mut c_void) {
     if ptr.is_null() {
         return;
     }
-    let _ = guard(|| unsafe {
-        let (g, d) = dev_of(device)?;
-        let mut size = 0usize;
-        let rc = (g.cl.clGetMemObjectInfo)(ptr, CL_MEM_SIZE, 8, &mut size as *mut usize as *mut c_void, null_mut());
-        if rc == 0 {
-            d.allocated.fetch_sub(size as u64, Ordering::Relaxed);
+    let _ = guard(|| {
+        let (_, d) = dev_of(device)?;
+        let mut c = cache_lock(d);
+        // Buffers are reused, not released: in-order queue semantics make reuse safe while earlier work
+        // that touched the buffer is still in flight.
+        if let Some(&size) = c.sizes.get(&(ptr as usize)) {
+            c.free.entry(size).or_default().push(ptr as usize);
+            c.cached_bytes += size as u64;
         }
-        // The runtime defers destruction until queued work using the buffer has finished.
-        check((g.cl.clReleaseMemObject)(ptr), "clReleaseMemObject")
+        Ok(())
     });
 }
 
@@ -578,8 +658,11 @@ unsafe extern "C" fn device_info(device: u32, out: *mut DeviceInfo) -> Status {
         for (dst, &b) in info.name.iter_mut().zip(d.name.as_bytes().iter().take(63)) {
             *dst = b as c_char;
         }
-        // OpenCL has no free-memory query: this is total minus what this plugin has allocated.
-        info.free_memory = d.total.saturating_sub(d.allocated.load(Ordering::Relaxed));
+        // OpenCL has no free-memory query: this is total minus what this plugin holds that is not
+        // reusable (cached buffers are free to the next allocation).
+        let cached = cache_lock(d).cached_bytes;
+        let in_use = d.allocated.load(Ordering::Relaxed).saturating_sub(cached);
+        info.free_memory = d.total.saturating_sub(in_use);
         *out = info;
         Ok(())
     })
@@ -603,7 +686,7 @@ unsafe extern "C" fn supports_op(code: u32) -> u32 {
     use op::*;
     matches!(
         code,
-        NEG | EXP | LOG | RELU | TANH | STEP | ADD | SUB | MUL | DIV | MATMUL | SUM_AXIS | COPY | FILL | RAND_NORMAL
+        NEG | EXP | LOG | RELU | TANH | STEP | ADD | SUB | MUL | DIV | MATMUL | AXPY | SUM_AXIS | COPY | FILL | RAND_NORMAL
     ) as u32
 }
 
@@ -710,7 +793,7 @@ unsafe fn run(device: u32, op_code: u32, attrs: &OpAttrs, ins: &[T], outs: &[T])
         let need_in = match op_code {
             FILL | RAND_NORMAL => 0,
             NEG | EXP | LOG | RELU | TANH | STEP | COPY | SUM_AXIS => 1,
-            ADD | SUB | MUL | DIV | MATMUL => 2,
+            ADD | SUB | MUL | DIV | MATMUL | AXPY => 2,
             _ => return fail(STATUS_UNSUPPORTED, format!("unsupported op {op_code}")),
         };
         if ins.len() != need_in {
@@ -819,6 +902,22 @@ unsafe fn run(device: u32, op_code: u32, attrs: &OpAttrs, ins: &[T], outs: &[T])
                     )
                 }
             }
+            AXPY => {
+                let (a, b) = (&ins[0], &ins[1]);
+                if a.numel() != n || b.numel() != n || !a.is_contiguous() || !b.is_contiguous() {
+                    return fail(STATUS_INVALID_ARGUMENT, "axpy needs contiguous inputs matching the output");
+                }
+                let alpha = f32::from_bits(attrs.ints[0] as u32);
+                launch(
+                    g,
+                    d,
+                    st,
+                    "axpy",
+                    &[Arg::Mem(a.data), Arg::Mem(b.data), Arg::Mem(out.data), Arg::U64(n), Arg::F32(alpha)],
+                    &[ew_global(n)],
+                    Some(&[256]),
+                )
+            }
             MATMUL => {
                 let (a, b) = (&ins[0], &ins[1]);
                 if a.shape.len() != 2 || b.shape.len() != 2 || out.shape.len() != 2 {
@@ -833,6 +932,18 @@ unsafe fn run(device: u32, op_code: u32, attrs: &OpAttrs, ins: &[T], outs: &[T])
                 }
                 if m == 0 || nn == 0 {
                     return Ok(());
+                }
+                // Sub-group fast path for tile-friendly shapes (see kernels.cl), when the driver has it.
+                if m % 16 == 0 && nn % 32 == 0 && k % 16 == 0 && k > 0 && st.kernels.as_ref().unwrap().contains_key("matmul_sg") {
+                    return launch(
+                        g,
+                        d,
+                        st,
+                        "matmul_sg",
+                        &[Arg::Mem(a.data), Arg::Mem(b.data), Arg::Mem(out.data), Arg::U64(m), Arg::U64(nn), Arg::U64(k)],
+                        &[(nn / 32) as usize * 16, (m / 16) as usize],
+                        Some(&[16, 1]),
+                    );
                 }
                 let gx = nn.div_ceil(64) as usize * 16;
                 let gy = m.div_ceil(64) as usize * 16;

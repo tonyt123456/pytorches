@@ -218,7 +218,7 @@ Found while building and testing the CUDA and Intel Arc plugins and the demo.
 - [ ] ABI: stream/event handles (the CUDA caching allocator currently relies on a single stream; `alloc`/`free` will need a stream or fence argument)
 - [ ] Core: use `copy_device_to_device` for same-device moves; peer copies where plugins support them
 - [ ] CUDA: tune matmul (cuBLAS/cuBLASLt via dynamic load, or a better kernel); measured ~4.8 TFLOP/s at 4096³
-- [ ] Arc: tune matmul (sub-groups, DPAS/matrix extensions); measured ~1.0 TFLOP/s, and exp is compute-bound at 14-19 GB/s
+- [ ] Arc: matmul is at 2.0-2.4 TFLOP/s (sub-group kernel, up from 1.0) against a measured 4.1 fp32 peak and PyTorch's 4.0-4.3. The matrix engines (DPAS) are fp16/bf16/int8 only, so they are for a reduced-precision path, not this gap. Exp is compute-bound at 14-19 GB/s.
 - [ ] Arc: move from OpenCL to Level Zero + SPIR-V (OpenCL is a pragmatic first runtime)
 - [ ] Matmul and `sum_axis` accept only contiguous inputs in the GPU plugins; the core always passes contiguous ones, but fix it before strided views land
 - [ ] Test the no-hardware path on a machine without an NVIDIA GPU / Intel GPU (plugins must return 0 devices quietly)
@@ -236,9 +236,12 @@ Found while building and testing the CUDA and Intel Arc plugins and the demo.
 Ordered by payoff.
 
 - [ ] **CPU plugin: threading + SIMD + blocked matmul.** 10-50x behind MKL (matmul 22 vs 611 GFLOP/s, sum 1.8 vs 88 GB/s). Start with rayon over rows/chunks and a packed, vectorized matmul.
-- [ ] **Intel plugin: caching allocator.** `add` on 64M floats runs at 17 GB/s vs PyTorch's 91 GB/s mostly because each call creates and commits a fresh 256 MB buffer. Reuse freed buffers by size, like the CUDA plugin does.
-- [ ] **Intel plugin: matmul on the matrix engines** (DPAS / `cl_intel_subgroup_matrix_multiply_accumulate`, or Level Zero + oneDNN). 1.0 vs ~4 TFLOP/s today.
-- [ ] **CUDA plugin: matmul tuning.** 3.3-3.7 vs cuBLAS 5.2-6.1 TFLOP/s (fp32). Try larger micro-tiles, double-buffered shared memory, vectorized loads; consider calling cuBLAS when present. Add an opt-in TF32 / bf16 tensor-core path (PyTorch reaches ~8.5 TFLOP/s with TF32).
-- [ ] CUDA `sum`: 239 vs 271 GB/s (0.88x), tune the reduction.
-- [ ] MLP step on CUDA is 0.54x: besides matmul, look at per-op overhead (every op allocates and launches separately; no fusion, no CUDA graphs) and the transposed-weight copies in backward.
+- [x] **Intel plugin: caching allocator.** `add` on 64M floats 17 -> 80 GB/s (PyTorch 86). Freed buffers are reused by size bucket; the cache is flushed when an allocation fails, and cached bytes count as free in `device_info`.
+- [~] **Intel plugin: matmul.** Sub-group kernel for M % 16, N % 32, K % 16 (about 2x, see benchmarks/README.md). Open: close the rest of the gap to ~4 TFLOP/s on the vector units (SLM tiles, a different load pattern), handle non-tile shapes without the slow kernel, and add a DPAS fp16/bf16 path (needs those dtypes).
+- [ ] Intel plugin: `sum` is 0.77x of PyTorch (63 vs 82 GB/s); `MATMUL_T` is not implemented (core materializes transposes for backward).
+- [x] **CUDA plugin: matmul** now calls cuBLAS (runtime-loaded, built-in kernel as fallback): 1.00x of PyTorch fp32. Still open: tune the fallback kernel (4-5 vs 6.5 TFLOP/s), and an opt-in TF32 / bf16 tensor-core path (PyTorch reaches ~8.5 TFLOP/s with TF32; needs the f16/bf16 dtypes).
+- [x] CUDA `sum` / `add`: vectorized (float4) kernels; at parity. The earlier gap was GPU memory throttling during measurement (benchmarks/README.md, pitfall 4).
+- [x] MLP step on CUDA: 0.54x -> ~0.93x via `MATMUL_T` (no transposed copies), skipping unneeded input gradients, and a fused `AXPY` optimizer update. Remaining ~7%: per-op allocate/launch overhead (no fusion, no CUDA graphs).
+- [ ] Optional ABI ops `MATMUL_T` and `AXPY`: CUDA has both, Arc has `AXPY`, the CPU plugin has neither (core falls back to the old path). Add `MATMUL_T` to Arc and both to CPU.
+- [x] `calibrate()` bounds its queued work (syncs every 4 matmuls). It used to enqueue for a fixed amount of host time, which was harmless while Arc allocation was slow but queued minutes of GPU work once allocation was cached. The differential suite went from ~20 s to ~2.4 s.
 - [ ] Benchmarks: add a regression guard (track numbers per commit), and extend workloads (attention-shaped matmuls, softmax, layernorm) once those ops exist.

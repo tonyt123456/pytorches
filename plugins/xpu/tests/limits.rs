@@ -151,3 +151,37 @@ fn absurd_allocation_fails_cleanly() {
         }
     }
 }
+
+#[test]
+fn freed_buffers_are_reused_and_not_counted_as_used() {
+    unsafe {
+        let Ok(lib) = Library::new(dll()) else { return };
+        let entry: unsafe extern "C" fn() -> *const PluginVTable = *lib.get(ENTRY_SYMBOL).unwrap();
+        let vt = &*entry();
+        if (vt.device_count)() == 0 {
+            return;
+        }
+        let free_mem = || {
+            let mut info = std::mem::zeroed::<DeviceInfo>();
+            assert_eq!((vt.device_info)(0, &mut info), STATUS_OK);
+            info.free_memory
+        };
+        let bytes = 64usize << 20;
+        let mut a = null_mut();
+        assert_eq!((vt.alloc)(0, bytes, &mut a), STATUS_OK);
+        let while_held = free_mem();
+        (vt.free)(0, a);
+        // The buffer is parked in the cache, which must count as free for planning purposes...
+        assert!(free_mem() >= while_held + (bytes as u64 - (2 << 20)), "cached buffer still counted as used");
+        // ...and the next request of the same size must get that very buffer back, not a new one.
+        let mut b = null_mut();
+        assert_eq!((vt.alloc)(0, bytes, &mut b), STATUS_OK);
+        assert_eq!(a, b, "same-size allocation did not reuse the freed buffer");
+        // A slightly smaller request lands in the same bucket and reuses it too.
+        (vt.free)(0, b);
+        let mut c: *mut c_void = null_mut();
+        assert_eq!((vt.alloc)(0, bytes - 4096, &mut c), STATUS_OK);
+        assert_eq!(a, c, "same-bucket allocation did not reuse the freed buffer");
+        (vt.free)(0, c);
+    }
+}
