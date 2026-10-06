@@ -13,4 +13,4 @@ class SGD:
     def step(self):
         for p in self.params:
             if p.grad is not None:
-                p.copy_(p.detach() - p.grad * self.lr)
+                p.axpy_(-self.lr, p.grad)

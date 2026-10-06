@@ -83,6 +83,11 @@ impl PyTensor {
         guard(|| self.0.copy_(&src.0))
     }
 
+    /// In-place `self += alpha * other` (shapes must match); not tracked by autograd.
+    fn axpy_(&self, alpha: f32, other: &PyTensor) -> PyResult<()> {
+        guard(|| self.0.axpy_(alpha, &other.0))
+    }
+
     fn to(&self, device: &str) -> PyResult<PyTensor> {
         let dev = parse_device(device)?;
         guard(|| PyTensor(self.0.to(&dev)))

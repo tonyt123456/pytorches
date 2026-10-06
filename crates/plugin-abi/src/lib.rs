@@ -72,6 +72,12 @@ pub mod op {
     pub const MATMUL: u32 = 200;
     /// Sum over axis `attrs.ints[0]`, removing it; contiguous input.
     pub const SUM_AXIS: u32 = 201;
+    /// Optional. Matmul over *stored* (contiguous, row-major) operands with transpose flags in
+    /// `attrs.ints[0]`: bit 0 = use `A^T`, bit 1 = use `B^T`. Output is `[m,n]`; the stored `A` is
+    /// `[m,k]` (or `[k,m]` with bit 0) and the stored `B` is `[k,n]` (or `[n,k]` with bit 1). Lets a
+    /// plugin hand the flags to a BLAS instead of the core materializing transposed copies. A plugin
+    /// that does not advertise it via `supports_op` gets `MATMUL` on explicitly transposed copies.
+    pub const MATMUL_T: u32 = 202;
 
     /// Materialize a (possibly strided / broadcast) input into a contiguous output.
     pub const COPY: u32 = 300;
@@ -89,6 +95,12 @@ pub mod op {
     /// where `splitmix64(x)`: `x += 0x9E3779B97F4A7C15; x = (x ^ (x>>30)) * 0xBF58476D1CE4E5B9;
     /// x = (x ^ (x>>27)) * 0x94D049BB133111EB; x ^ (x>>31)` (wrapping u64 arithmetic).
     pub const RAND_NORMAL: u32 = 401;
+
+    /// Optional fused update: `out = in0 + alpha * in1`, where `alpha` is the f32 bit pattern in
+    /// `attrs.ints[0]` and both inputs have the output's shape (contiguous). `out` may be the same
+    /// buffer as `in0` (an in-place update). One pass over memory instead of a multiply, an add and
+    /// a copy, which is what optimizers spend their time on. Without it the core composes those ops.
+    pub const AXPY: u32 = 500;
 }
 
 /// A tensor argument. `shape` and `strides` point to `ndim` entries; strides are in elements.

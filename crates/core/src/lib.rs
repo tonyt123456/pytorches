@@ -125,6 +125,11 @@ pub struct DeviceInfo {
 }
 
 impl Device {
+    /// Whether this device's plugin implements `code` (optional ops like `MATMUL_T` and `AXPY`).
+    pub fn supports_op(&self, code: u32) -> bool {
+        unsafe { (self.plugin.vt.supports_op)(code) != 0 }
+    }
+
     /// Parses `"cuda:0"`, `"cpu"` (index defaults to 0).
     pub fn parse(s: &str) -> Result<Device, String> {
         let (name, index) = match s.split_once(':') {
@@ -662,18 +667,46 @@ impl Tensor {
             self.shape(),
             o.shape()
         );
-        let (m, n) = (self.shape()[0], o.shape()[1]);
-        let out = run_op(
-            &self.device(),
-            op::MATMUL,
-            [0; 4],
-            &[Operand::contiguous(self), Operand::contiguous(o)],
-            &[m, n],
-        );
+        let out = self.raw_matmul(false, o, false);
         let (a, b) = (self.detach(), o.detach());
+        // Only compute the gradients somebody asked for (the first layer's input never needs one).
+        let (need_a, need_b) = (self.requires_grad(), o.requires_grad());
         out.attach(vec![self.clone(), o.clone()], move |g| {
-            vec![Some(g.matmul(&b.t())), Some(a.t().matmul(g))]
+            vec![need_a.then(|| g.raw_matmul(false, &b, true)), need_b.then(|| a.raw_matmul(true, g, false))]
         })
+    }
+
+    /// Graph-free `op(self) x op(o)` over stored row-major tensors, where `op` is a transpose when the
+    /// matching flag is set. Plugins that implement `MATMUL_T` take the flags directly; for the rest
+    /// the transposes are materialized first.
+    fn raw_matmul(&self, ta: bool, o: &Tensor, tb: bool) -> Tensor {
+        let (sa, sb) = (self.shape(), o.shape());
+        assert!(sa.len() == 2 && sb.len() == 2, "matmul needs 2-D tensors, got {sa:?} x {sb:?}");
+        let (m, k) = if ta { (sa[1], sa[0]) } else { (sa[0], sa[1]) };
+        let (kb, n) = if tb { (sb[1], sb[0]) } else { (sb[0], sb[1]) };
+        assert_eq!(k, kb, "matmul inner dimensions differ: {sa:?}{} x {sb:?}{}", if ta { "^T" } else { "" }, if tb { "^T" } else { "" });
+        let dev = self.device();
+        if (ta || tb) && dev.supports_op(op::MATMUL_T) {
+            let flags = ta as i64 | (tb as i64) << 1;
+            return run_op(&dev, op::MATMUL_T, [flags, 0, 0, 0], &[Operand::contiguous(self), Operand::contiguous(o)], &[m, n]);
+        }
+        let (a, b) = (if ta { self.raw_t() } else { self.clone() }, if tb { o.raw_t() } else { o.clone() });
+        run_op(&dev, op::MATMUL, [0; 4], &[Operand::contiguous(&a), Operand::contiguous(&b)], &[m, n])
+    }
+
+    /// In-place `self += alpha * other` (same shape). Uses the plugin's fused `AXPY` when it has one.
+    /// Not differentiable; meant for optimizer updates.
+    pub fn axpy_(&self, alpha: f32, other: &Tensor) {
+        assert_eq!(self.shape(), other.shape(), "axpy_ shape mismatch: {:?} vs {:?}", self.shape(), other.shape());
+        let dev = self.device();
+        let other = other.to(&dev);
+        if dev.supports_op(op::AXPY) {
+            let ints = [alpha.to_bits() as i64, 0, 0, 0];
+            run_op_into(&dev, op::AXPY, ints, &[Operand::contiguous(self), Operand::contiguous(&other)], &self.0.data, self.shape());
+        } else {
+            let scaled = other.raw_binary(&Tensor::scalar_on(alpha, &dev), op::MUL);
+            self.copy_(&self.raw_binary(&scaled, op::ADD));
+        }
     }
 
     /// 2-D transpose (materialized).
@@ -817,6 +850,23 @@ mod tests {
         // dA = ones @ B^T, dB = A^T @ ones
         assert_eq!(a.grad().unwrap().to_vec(), vec![11.0, 15.0, 11.0, 15.0]);
         assert_eq!(b.grad().unwrap().to_vec(), vec![4.0, 4.0, 6.0, 6.0]);
+    }
+
+    #[test]
+    fn axpy_in_place_and_transposed_matmul_grads() {
+        init();
+        let cpu = Device::parse("cpu").unwrap();
+        let a = Tensor::from_vec_on(vec![1.0, 2.0, 3.0], vec![3], &cpu);
+        let b = Tensor::from_vec_on(vec![10.0, 20.0, 30.0], vec![3], &cpu);
+        a.axpy_(-0.5, &b);
+        assert_eq!(a.to_vec(), vec![-4.0, -8.0, -12.0]);
+
+        // [2,3] x [3,2]: d(sum)/dA = ones x B^T, d(sum)/dB = A^T x ones.
+        let x = Tensor::from_vec_on(vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0], vec![2, 3], &cpu).requires_grad_(true);
+        let w = Tensor::from_vec_on(vec![1.0, 0.0, 0.0, 1.0, 1.0, 1.0], vec![3, 2], &cpu).requires_grad_(true);
+        x.matmul(&w).sum().backward();
+        assert_eq!(x.grad().unwrap().to_vec(), vec![1.0, 1.0, 2.0, 1.0, 1.0, 2.0]);
+        assert_eq!(w.grad().unwrap().to_vec(), vec![5.0, 5.0, 7.0, 7.0, 9.0, 9.0]);
     }
 
     #[test]

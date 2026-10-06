@@ -33,6 +33,12 @@ pub fn calibrate(device: &Device) -> f64 {
         loop {
             let _ = a.matmul(&b);
             iters += 1;
+            // Bound the queued work. The loop is paced by host time, and with a fast (cached)
+            // allocator a host can enqueue minutes of GPU work in a fraction of a second, so wait
+            // every few calls. Cheap: a matmul big enough to keep a GPU busy takes milliseconds.
+            if iters % 4 == 0 {
+                device.synchronize();
+            }
             if iters >= 2 && start.elapsed() >= min {
                 device.synchronize(); // include the queued work in the measurement
                 if start.elapsed() >= min {
