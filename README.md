@@ -4,8 +4,9 @@
 
 **One tensor library. Every GPU. No recompiling.**
 
-A PyTorch-interoperable tensor and autograd engine written in Rust, where every device
-backend is a **plugin** you drop into a folder.
+A PyTorch-interoperable tensor and autograd engine written in Rust. It detects your hardware
+and optimizes for it automatically. Developers can add support for new hardware by writing a
+plugin.
 
 ![status](https://img.shields.io/badge/status-early%20alpha-orange)
 ![rust](https://img.shields.io/badge/rust-2024-b7410e)
@@ -24,15 +25,17 @@ use both well.
 
 PyTorches turns that around:
 
-- **The core knows nothing about hardware.** It owns tensors, autograd and dispatch. That's it.
-- **Backends are plugins.** A plugin is a shared library behind a small, stable C ABI. Drop
-  `pytorches_plugin_cuda.dll` into `plugins/` and the CUDA devices appear. No core rebuild.
-- **The plugins pick themselves.** The core has no hardware knowledge and no list of vendors.
-  It loads the plugins it finds, and each plugin runs its own hardware test. Only plugins that
-  find usable devices stay loaded, so one plugin folder works on any machine.
-- **Different people can own different backends.** NVIDIA, AMD and Intel plugins can live in
-  separate repos with separate release cycles. They only depend on one tiny `#![no_std]` crate
-  (or a header, since C and C++ plugins work too).
+- **Hardware optimization is automatic.** PyTorches detects what's in your machine at startup
+  and uses the matching backends. You don't choose a CUDA vs ROCm vs XPU build, and you don't
+  configure anything. The same install works on an NVIDIA machine, an Intel Arc machine, or a
+  machine with both.
+- **The core stays hardware-agnostic.** It owns tensors, autograd and dispatch, and has no list
+  of vendors. Each hardware backend is a separate **plugin** behind a small, stable C ABI, and
+  each plugin runs its own hardware test, so only the ones that fit your machine are used.
+- **Developers can add hardware support without touching the core.** If you build an
+  accelerator, or want to tune for one, you write a plugin. NVIDIA, AMD and Intel plugins can
+  live in separate repos with separate release cycles. A plugin depends on one tiny
+  `#![no_std]` crate (or a header, since C and C++ plugins work too).
 - **Heterogeneous machines are the target.** An 8 GB discrete GPU next to an iGPU with 47 GB
   of shared memory should be one pool of devices, not two incompatible installs.
 
@@ -54,9 +57,12 @@ PyTorches turns that around:
         └───────────────┘  └───────────────┘  └───────────────┘
 ```
 
-**How plugins get selected**
+**How hardware gets picked up automatically**
 
-1. At startup the core scans the plugin directory for `pytorches_plugin_*` libraries.
+You don't do anything: PyTorches ships with its backends, and at startup it works out which
+ones apply to your machine.
+
+1. The core scans the plugin directory for `pytorches_plugin_*` libraries.
 2. It loads each one and checks the ABI version.
 3. It calls the plugin's `device_count()`. That call is the **hardware test**, and the plugin
    owns it: a CUDA plugin asks the NVIDIA driver, an Intel plugin asks Level Zero, and so on.
@@ -64,11 +70,11 @@ PyTorches turns that around:
    **unloaded and ignored**. A plugin that reports devices is registered, and its devices
    show up as `cuda:0`, `xpu:0`, and so on.
 
-So the same plugin folder can ship to a machine with an NVIDIA GPU, one with an Arc GPU, or
-neither, and each machine ends up with only the backends it can actually use. Because the
-core never inspects hardware itself, supporting a new accelerator never touches the core.
+So the same install works on a machine with an NVIDIA GPU, one with an Arc GPU, or neither,
+and each machine ends up with only the backends it can actually use. Because the core never
+inspects hardware itself, supporting a new accelerator never touches the core.
 
-**How a plugin works**
+**How a plugin works** *(for developers)*
 
 - It exports one symbol, `pytorches_plugin_entry`, returning a static vtable: device
   enumeration, `alloc`/`free`, host copies, `supports_op`, `execute`, `synchronize`.
@@ -126,11 +132,11 @@ Move work between devices; the move is differentiable:
 
 ```python
 t = pt.Tensor([1.0, 2.0], [2], device="cpu:0")
-t.to("cuda:0")                      # once the CUDA plugin is installed
+t.to("cuda:0")                      # available once the CUDA backend lands (planned)
 ```
 
-Plugins are found in `$PYTORCHES_PLUGIN_DIR`, else `./plugins/bin`, else `<exe dir>/plugins`.
-Only files named `pytorches_plugin_*` are considered.
+*Advanced:* plugins are found in `$PYTORCHES_PLUGIN_DIR`, else `./plugins/bin`, else
+`<exe dir>/plugins`. Only files named `pytorches_plugin_*` are considered.
 
 ## Correctness first
 
@@ -142,7 +148,10 @@ gradients**. A new backend inherits that oracle for free.
 .venv\Scripts\python -m unittest discover -s tests\diff -v
 ```
 
-## Writing a plugin
+## For developers: writing a plugin
+
+Most users never need this. It's for people adding support for new hardware, or tuning for
+existing hardware, without touching the core.
 
 1. `cargo new --lib plugins/<name>`, set `crate-type = ["cdylib"]`, depend on
    [`pytorches-plugin-abi`](crates/plugin-abi/src/lib.rs). The crate is the full contract
