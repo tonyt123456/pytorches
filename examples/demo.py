@@ -23,12 +23,18 @@ def hr(title):
     print(f"\n{'=' * 78}\n{title}\n{'=' * 78}")
 
 
-def train(sizes, batch, device, steps, label):
-    """Build `sizes` as an MLP on `device`, run SGD steps, print per-step timing."""
+def train(sizes, batch, required_bytes, steps, label):
+    """Build `sizes` as an MLP on the best device that can hold it, then run SGD steps."""
     t0 = time.time()
-    model = pt.nn.mlp(sizes, device)
-    x = pt.randn([batch, sizes[0]], device, seed=1)
-    y = pt.randn([batch, sizes[-1]], device, seed=2)
+
+    def build(device):
+        model = pt.nn.mlp(sizes, device)
+        x = pt.randn([batch, sizes[0]], device, seed=1)
+        y = pt.randn([batch, sizes[-1]], device, seed=2)
+        return model, x, y
+
+    # place() tries the planned device first and falls back if it runs out of memory.
+    device, (model, x, y) = pt.place(build, required_bytes)
     opt = pt.optim.SGD(model.parameters(), lr=1e-3)
     params = model.num_parameters()
     print(f"  built {label}: {params / 1e6:,.0f}M parameters "
@@ -44,7 +50,7 @@ def train(sizes, batch, device, steps, label):
         losses.append(loss.item())  # .item() also synchronizes the device
         times.append(time.time() - t)
         print(f"  step {step + 1}/{steps}: loss {losses[-1]:.4f}  ({times[-1] * 1000:,.0f} ms)")
-    return times
+    return device
 
 
 def main():
@@ -73,7 +79,7 @@ def main():
     print(plan)
     if not args.dry_run:
         print()
-        train(small, 256, plan.device, args.steps, "small model")
+        train(small, 256, need, args.steps, "small model")
 
     hr("4. A model that does NOT fit the fast GPU")
     big = [args.width] * (args.layers + 1)
@@ -85,8 +91,8 @@ def main():
             print("\n  (no device reports enough free memory; skipping the run)")
         else:
             print()
-            train(big, 32, plan.device, args.steps, "big model")
-            print(f"\n  Same script, no flags: placement chose {plan.device} on its own.")
+            device = train(big, 32, need, args.steps, "big model")
+            print(f"\n  Same script, no flags: it ran on {device} on its own.")
 
 
 def train_quiet(sizes, batch, device, steps):

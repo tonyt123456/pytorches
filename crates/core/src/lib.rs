@@ -12,16 +12,100 @@ pub mod plugin;
 
 use plugin::Plugin;
 use pytorches_plugin_abi::{self as abi, OpAttrs, TensorDesc, op};
+use std::cell::Cell;
 use std::collections::{HashMap, HashSet};
 use std::ffi::c_void;
 use std::fmt;
+use std::panic::{self, AssertUnwindSafe};
 use std::ops::{Add, Div, Mul, Neg, Sub};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, Once};
 
 fn next_id() -> u64 {
     static NEXT: AtomicU64 = AtomicU64::new(0);
     NEXT.fetch_add(1, Ordering::Relaxed)
+}
+
+// ---- errors ---------------------------------------------------------------------
+
+/// Errors raised by the core.
+///
+/// Internally they travel as typed panic payloads, so op signatures stay simple. Callers that
+/// want to handle them (the Python bindings, embedders) wrap work in [`try_run`], which turns any
+/// panic into an `Error`: typed errors keep their kind, other panics (shape or device mismatches
+/// raised with `assert!`) become [`Error::Invalid`].
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Error {
+    /// A device ran out of memory. The tensor was not created; other devices may still work.
+    OutOfMemory(String),
+    /// The caller passed something invalid (shape/device mismatch, unsupported op, bad argument).
+    Invalid(String),
+    /// A plugin reported an unexpected failure.
+    Backend(String),
+}
+
+impl fmt::Display for Error {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Error::OutOfMemory(m) | Error::Invalid(m) | Error::Backend(m) => f.write_str(m),
+        }
+    }
+}
+
+impl std::error::Error for Error {}
+
+thread_local! {
+    static GUARD_DEPTH: Cell<u32> = const { Cell::new(0) };
+}
+
+fn install_quiet_hook() {
+    static ONCE: Once = Once::new();
+    ONCE.call_once(|| {
+        let prev = panic::take_hook();
+        // Inside `try_run` the panic is reported through the returned `Error`, so don't also
+        // print it to stderr.
+        panic::set_hook(Box::new(move |info| {
+            if GUARD_DEPTH.with(Cell::get) == 0 {
+                prev(info);
+            }
+        }));
+    });
+}
+
+/// Runs `f`, converting any panic raised inside it into an [`Error`].
+pub fn try_run<T>(f: impl FnOnce() -> T) -> Result<T, Error> {
+    install_quiet_hook();
+    GUARD_DEPTH.with(|d| d.set(d.get() + 1));
+    let result = panic::catch_unwind(AssertUnwindSafe(f));
+    GUARD_DEPTH.with(|d| d.set(d.get() - 1));
+    result.map_err(|payload| match payload.downcast::<Error>() {
+        Ok(e) => *e,
+        Err(payload) => {
+            let msg = payload
+                .downcast_ref::<String>()
+                .cloned()
+                .or_else(|| payload.downcast_ref::<&str>().map(|s| s.to_string()))
+                .unwrap_or_else(|| "internal error".into());
+            Error::Invalid(msg)
+        }
+    })
+}
+
+fn raise(e: Error) -> ! {
+    panic::resume_unwind(Box::new(e))
+}
+
+/// Raises the right [`Error`] kind if a plugin call did not return `STATUS_OK`.
+fn check(status: abi::Status, plugin: &Plugin, what: impl FnOnce() -> String) {
+    if status == abi::STATUS_OK {
+        return;
+    }
+    let msg = format!("{}: {}", what(), plugin.last_error());
+    raise(match status {
+        abi::STATUS_OUT_OF_MEMORY => Error::OutOfMemory(msg),
+        abi::STATUS_INVALID_ARGUMENT | abi::STATUS_UNSUPPORTED => Error::Invalid(msg),
+        _ => Error::Backend(msg),
+    })
 }
 
 // ---- devices ------------------------------------------------------------------
@@ -122,7 +206,7 @@ impl Buffer {
         let mut ptr = std::ptr::null_mut();
         let bytes = (numel * 4).max(4);
         let status = unsafe { (device.plugin.vt.alloc)(device.index, bytes, &mut ptr) };
-        assert_eq!(status, abi::STATUS_OK, "alloc of {bytes} bytes on {device} failed: {}", device.plugin.last_error());
+        check(status, &device.plugin, || format!("alloc of {bytes} bytes on {device} failed"));
         Buffer { device: device.clone(), ptr }
     }
 }
@@ -254,7 +338,7 @@ fn run_op_into(device: &Device, code: u32, ints: [i64; 4], ins: &[Operand], out_
     let status = unsafe {
         (vt.execute)(device.index, code, &attrs, in_descs.as_ptr(), in_descs.len() as u32, &out_desc, 1)
     };
-    assert_eq!(status, abi::STATUS_OK, "op {code} failed on {device}: {}", device.plugin.last_error());
+    check(status, &device.plugin, || format!("op {code} failed on {device}"));
 }
 
 impl Tensor {
@@ -270,7 +354,7 @@ impl Tensor {
         let status = unsafe {
             (device.plugin.vt.copy_from_host)(device.index, buf.ptr, data.as_ptr() as *const c_void, data.len() * 4)
         };
-        assert_eq!(status, abi::STATUS_OK, "host->device copy failed: {}", device.plugin.last_error());
+        check(status, &device.plugin, || "host->device copy failed".to_string());
         Self::build(Arc::new(buf), shape, false, None)
     }
 
@@ -359,7 +443,7 @@ impl Tensor {
         let status = unsafe {
             (dev.plugin.vt.copy_to_host)(dev.index, out.as_mut_ptr() as *mut c_void, self.0.data.ptr, out.len() * 4)
         };
-        assert_eq!(status, abi::STATUS_OK, "device->host copy failed: {}", dev.plugin.last_error());
+        check(status, &dev.plugin, || "device->host copy failed".to_string());
         out
     }
 
@@ -747,6 +831,26 @@ mod tests {
         assert_eq!(p.chosen.to_string(), "cpu:0");
         assert!(!p.may_oom);
         assert!(p.candidates[0].gflops > 0.0);
+    }
+
+    #[test]
+    fn errors_are_typed_not_aborts() {
+        init();
+        // shape mismatch -> Invalid, with the message preserved
+        let a = Tensor::new(vec![1.0; 6], vec![2, 3]);
+        let b = Tensor::new(vec![1.0; 6], vec![2, 3]);
+        match try_run(|| a.matmul(&b)) {
+            Err(Error::Invalid(m)) => assert!(m.contains("matmul"), "{m}"),
+            other => panic!("expected Invalid, got {other:?}"),
+        }
+        // absurd allocation -> OutOfMemory (the cpu plugin reports STATUS_OUT_OF_MEMORY)
+        let dev = Device::default_device();
+        match try_run(|| Tensor::zeros_on(&[1 << 40, 1 << 20], &dev)) {
+            Err(Error::OutOfMemory(m)) => assert!(m.contains("alloc"), "{m}"),
+            other => panic!("expected OutOfMemory, got {other:?}"),
+        }
+        // and the library still works afterwards
+        assert_eq!(try_run(|| Tensor::ones_on(&[2], &dev).to_vec()).unwrap(), vec![1.0, 1.0]);
     }
 
     #[test]

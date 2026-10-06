@@ -128,6 +128,9 @@ need = pt.nn.estimate_mlp_training_bytes([8192] * 13, batch=32)
 plan = pt.plan(need)                          # profiles devices, checks free memory
 print(plan)                                   # table + the reason
 model = pt.nn.mlp([8192] * 13, device=plan.device)
+
+# or let it build on the best device and fall back if that one runs out of memory:
+device, model = pt.place(lambda dev: pt.nn.mlp([8192] * 13, dev), need)
 ```
 
 Tensors can also be moved explicitly, and the move is differentiable:
@@ -240,7 +243,9 @@ matmul is tiled but untuned, there is no fusion), and the op set is small.
 - **Three backends as plugins:** CPU (reference), NVIDIA CUDA, Intel GPU (OpenCL)
 - Automatic plugin selection by each plugin's own hardware test
 - Device-side tensor creation (constants and a cross-device-reproducible `randn`), in-place updates
-- Automatic placement: `pt.plan()` profiles devices and picks one by speed and free memory
+- Automatic placement: `pt.plan()` profiles devices and picks one by speed and free memory;
+  `pt.place()` builds on it and falls back to the next device on `MemoryError`
+- Failures are ordinary Python exceptions: `MemoryError`, `ValueError`, `RuntimeError`
 - `pt.doctor()` hardware report; minimal `nn` (Linear, ReLU, Sequential, MSE) and SGD
 - Differential tests against PyTorch on every detected device
 
@@ -249,7 +254,6 @@ matmul is tiled but untuned, there is no fusion), and the op set is small.
 - A tensor must live wholly on one device; a model that fits no single device can't be split yet.
 - Free memory on the Intel iGPU is an estimate (OpenCL has no free-memory query), and it shares
   system RAM, so a plan can be optimistic when RAM is tight.
-- Running out of device memory currently aborts the Python call with a panic instead of a clean error.
 - Only `f32`, contiguous tensors, 2-D matmul.
 
 **Next**
@@ -260,7 +264,8 @@ matmul is tiled but untuned, there is no fusion), and the op set is small.
 - [ ] ROCm plugin
 - [ ] DLPack zero-copy exchange with `torch.Tensor`; `safetensors` and `state_dict` loading
 - [ ] Splitting a model across devices, with spill/offload and transfer cost in the planner
-- [ ] Clean out-of-memory errors; streams/async in the ABI
+- [x] Clean out-of-memory errors (`MemoryError`) and fallback to the next device (`pt.place`)
+- [ ] Streams/async in the ABI
 - [ ] Strided views, more dtypes (f16/bf16/i64), more ops, a fuller `nn`, more optimizers
 - [ ] Fusion and tuned matmul/attention kernels
 - [ ] Bundled plugins in the Python wheel, plus on-demand plugin download

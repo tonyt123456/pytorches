@@ -34,7 +34,7 @@ from ._native import (  # noqa: E402,F401
     randn,
     synchronize,
 )
-from ._report import Plan, doctor, plan  # noqa: E402,F401
+from ._report import Plan, doctor, plan, place  # noqa: E402,F401
 from . import nn, optim  # noqa: E402,F401
 
 
@@ -48,5 +48,5 @@ def ones(shape, device=None, requires_grad=False):
 
 __all__ = [
     "Tensor", "randn", "zeros", "ones", "full", "devices", "device_info", "load_plugins",
-    "synchronize", "calibrate", "plan", "Plan", "doctor", "nn", "optim",
+    "synchronize", "calibrate", "plan", "place", "Plan", "doctor", "nn", "optim",
 ]

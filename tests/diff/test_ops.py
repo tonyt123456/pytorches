@@ -165,6 +165,27 @@ def training_test(self):
     self.assertLess(last, first * 0.9, f"loss did not drop: {first} -> {last}")
 
 
+def error_handling_test(self):
+    """Failures surface as ordinary Python exceptions, and the device keeps working."""
+    # Out of memory -> MemoryError (not a PanicException). 2^60 floats is far beyond any device,
+    # and a request that big is rejected up front even where the OS overcommits memory.
+    with self.assertRaises(MemoryError):
+        pt.zeros([1 << 30, 1 << 30], self.device)
+    # Shape mismatch -> ValueError with a useful message.
+    a = pt.zeros([2, 3], self.device)
+    with self.assertRaises(ValueError) as ctx:
+        a @ a
+    self.assertIn("matmul", str(ctx.exception))
+    with self.assertRaises(ValueError):
+        a + pt.zeros([4], self.device)
+    # Plain `except Exception` works, and the device is still usable afterwards.
+    try:
+        pt.zeros([1 << 30, 1 << 30], self.device)
+    except Exception:
+        pass
+    self.assertEqual(pt.ones([3], self.device).tolist(), [1.0, 1.0, 1.0])
+
+
 def cross_device_test(self):
     t = pt.Tensor([1.0, -2.0, 3.0], [3], True, self.device)
     for other in DEVICES:
@@ -190,6 +211,7 @@ for _dev in DEVICES:
     _ns["test_in_place_copy"] = in_place_test
     _ns["test_training_reduces_loss"] = training_test
     _ns["test_cross_device_moves"] = cross_device_test
+    _ns["test_errors_are_python_exceptions"] = error_handling_test
     _cls = type(f"Diff_{_dev.replace(':', '_')}", (DeviceTestBase,), _ns)
     globals()[_cls.__name__] = _cls
 
@@ -226,6 +248,29 @@ class PluginTests(unittest.TestCase):
         self.assertIn(p.device, DEVICES)
         self.assertFalse(p.may_oom)
         self.assertIn("needs", p.reason)
+
+    def test_place_falls_back_after_out_of_memory(self):
+        if len(DEVICES) < 2:
+            self.skipTest("needs at least two devices")
+        tried = []
+
+        def build(dev):
+            tried.append(dev)
+            if len(tried) == 1:
+                raise MemoryError("simulated")
+            return "ok"
+
+        dev, result = pt.place(build, 1 << 20, verbose=False)
+        self.assertEqual(result, "ok")
+        self.assertEqual(len(tried), 2)
+        self.assertEqual(dev, tried[-1])
+
+    def test_place_raises_when_nothing_works(self):
+        def build(dev):
+            raise MemoryError("never fits")
+
+        with self.assertRaises(MemoryError):
+            pt.place(build, 1 << 20, verbose=False)
 
     def test_plan_too_big_for_anything(self):
         p = pt.plan(1 << 60)

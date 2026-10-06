@@ -65,3 +65,25 @@ def doctor(benchmark=True):
         mem = f"{_bytes(info['free_memory'])} free / {_bytes(info['total_memory'])}"
         speed = f"  {_speed(_native.calibrate(dev))}" if benchmark else ""
         print(f"  {dev:<8} {info['name'][:40]:<40} {mem}{speed}")
+
+
+def place(build, required_bytes, verbose=True):
+    """Build a workload on the best device, falling back if that device runs out of memory.
+
+    `build(device)` creates whatever the workload needs on `device` and returns it. The planner
+    picks the first device; if `build` raises `MemoryError` (free-memory figures are estimates,
+    especially for GPUs that share system RAM), the next device that is expected to fit is tried.
+
+    Returns `(device, result)`.
+    """
+    p = plan(required_bytes)
+    order = [p.device] + [c["device"] for c in p.candidates if c["fits"] and c["device"] != p.device]
+    last = None
+    for dev in order:
+        try:
+            return dev, build(dev)
+        except MemoryError as exc:
+            last = exc
+            if verbose:
+                print(f"  {dev}: out of memory ({exc}); trying the next device")
+    raise last if last else MemoryError("no device can hold this workload")

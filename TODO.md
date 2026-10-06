@@ -209,7 +209,7 @@ Fix the cracks now, while there is one backend. These get more expensive with ev
 Found while building and testing the CUDA and Intel Arc plugins and the demo.
 
 **P0**
-- [ ] **Out-of-memory must be an error, not a panic.** Plugins return a clean `STATUS_OUT_OF_MEMORY`, but the core asserts on any non-OK status, so the Python call dies with a `PanicException` (a `BaseException`). Make `Buffer::alloc`/`run_op` return `Result`, surface `MemoryError` in Python, and let the planner retry on another device.
+- [x] **Out-of-memory is an error, not a panic.** The core raises a typed `Error` (`OutOfMemory` / `Invalid` / `Backend`), `try_run` catches it, and Python gets `MemoryError` / `ValueError` / `RuntimeError`. `pt.place()` retries on the next device. Remaining: make the core API return `Result` natively instead of unwinding with typed payloads.
 - [ ] **Planner must account for shared memory.** The Arc iGPU draws from system RAM, and OpenCL has no free-memory query, so its "free" figure is `total - tracked`. Combine it with host free memory (and warn when a plan could page).
 - [ ] Planner decisions need a stable benchmark: calibration now warms up and takes the best of three, but add a variance check and an optional on-disk cache keyed by device + driver version.
 
