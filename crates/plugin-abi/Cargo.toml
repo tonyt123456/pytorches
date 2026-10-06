@@ -1,0 +1,6 @@
+[package]
+name = "pytorches-plugin-abi"
+description = "Stable C ABI between the PyTorches core and device plugins"
+version.workspace = true
+edition.workspace = true
+license.workspace = true

@@ -1,0 +1,11 @@
+[workspace]
+resolver = "3"
+members = ["crates/plugin-abi", "crates/core", "crates/python", "plugins/*"]
+exclude = ["plugins/bin"]
+# The python crate is built with maturin (extension-module can't link under `cargo test`).
+default-members = ["crates/plugin-abi", "crates/core", "plugins/*"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+license = "Apache-2.0"

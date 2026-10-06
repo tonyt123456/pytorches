@@ -1,0 +1,13 @@
+[package]
+name = "pytorches-core"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+pytorches-plugin-abi = { path = "../plugin-abi" }
+libloading = "0.8"
+
+[dev-dependencies]
+# Statically registered so core tests don't need a built .dll.
+pytorches-plugin-cpu = { path = "../../plugins/cpu" }

@@ -1,0 +1,7 @@
+/target
+/.venv
+__pycache__/
+*.pyd
+*.so
+/plugins/bin/*
+!/plugins/bin/.gitkeep
