@@ -1,6 +1,10 @@
 //! NVIDIA CUDA plugin. Uses the CUDA *driver* API loaded at runtime from nvcuda.dll (libcuda.so.1),
 //! so only the NVIDIA driver is needed. Kernels are embedded PTX, JIT-compiled by the driver.
 //! Everything runs on the primary context's default (NULL) stream.
+//!
+//! Matmul uses cuBLAS when it can be found at runtime (also loaded dynamically, so nothing is linked
+//! at build time) and falls back to our own tiled kernel otherwise. `PYTORCHES_CUBLAS` overrides the
+//! lookup: `0` disables cuBLAS, anything else is the path of the library to load.
 
 use libloading::Library;
 use pytorches_plugin_abi::*;
@@ -150,6 +154,76 @@ fn driver() -> Result<&'static Driver, &'static str> {
     .map_err(|s| s.as_str())
 }
 
+// ---- cuBLAS (optional) -----------------------------------------------------------------------
+
+struct Blas {
+    _lib: Library,
+    create: unsafe extern "C" fn(*mut Handle) -> c_int,
+    sgemm: unsafe extern "C" fn(
+        Handle, c_int, c_int, c_int, c_int, c_int, *const f32, CuPtr, c_int, CuPtr, c_int, *const f32, CuPtr, c_int,
+    ) -> c_int,
+}
+
+unsafe impl Send for Blas {}
+unsafe impl Sync for Blas {}
+
+impl Blas {
+    fn load() -> Result<Blas, String> {
+        let mut candidates: Vec<String> = Vec::new();
+        match std::env::var("PYTORCHES_CUBLAS") {
+            Ok(v) if v == "0" => return Result::Err("disabled by PYTORCHES_CUBLAS=0".into()),
+            Ok(v) if !v.is_empty() => candidates.push(v),
+            _ => {}
+        }
+        let names: &[&str] = if cfg!(windows) {
+            &["cublas64_13.dll", "cublas64_12.dll"]
+        } else {
+            &["libcublas.so.13", "libcublas.so.12"]
+        };
+        for n in names {
+            candidates.push(n.to_string());
+            if let Ok(cuda) = std::env::var("CUDA_PATH") {
+                candidates.push(format!("{cuda}/bin/{n}"));
+                candidates.push(format!("{cuda}/bin/x64/{n}"));
+            }
+        }
+        let mut last = String::from("no candidates");
+        for c in &candidates {
+            unsafe {
+                match Library::new(c) {
+                    Ok(lib) => {
+                        macro_rules! sym {
+                            ($n:literal) => {
+                                *lib.get(concat!($n, "\0").as_bytes()).map_err(|e| format!("{c}: missing {}: {e}", $n))?
+                            };
+                        }
+                        return Ok(Blas { create: sym!("cublasCreate_v2"), sgemm: sym!("cublasSgemm_v2"), _lib: lib });
+                    }
+                    Err(e) => last = format!("cannot load {c}: {e}"),
+                }
+            }
+        }
+        Result::Err(last)
+    }
+}
+
+fn blas() -> Option<&'static Blas> {
+    static B: OnceLock<Option<Blas>> = OnceLock::new();
+    B.get_or_init(|| match Blas::load() {
+        Ok(b) => Some(b),
+        Err(e) => {
+            if std::env::var_os("PYTORCHES_CUDA_VERBOSE").is_some() {
+                eprintln!("cuda plugin: cuBLAS unavailable ({e}); using built-in matmul");
+            }
+            None
+        }
+    })
+    .as_ref()
+}
+
+/// A cuBLAS handle is not safe to use from several threads at once, hence the mutex.
+struct BlasHandle(Mutex<usize>);
+
 // ---- per-device state -----------------------------------------------------------------
 
 #[derive(Default)]
@@ -162,9 +236,11 @@ struct Cache {
 struct Funcs {
     unary: Handle,
     binary: Handle,
+    binary_vec: Handle,
     fill: Handle,
     randn: Handle,
     matmul: Handle,
+    axpy: Handle,
     sum_rows: Handle,
     sum_cols: Handle,
     sum_parts: Handle,
@@ -174,6 +250,7 @@ struct Dev {
     dev: CuDevice,
     ctx: Handle,
     f: Funcs,
+    blas: Option<BlasHandle>,
     cache: Mutex<Cache>,
 }
 
@@ -206,14 +283,21 @@ fn init_dev(drv: &Driver, index: u32) -> Result<Dev, E> {
         let f = Funcs {
             unary: get("unary_k")?,
             binary: get("binary_k")?,
+            binary_vec: get("binary_vec_k")?,
             fill: get("fill_k")?,
             randn: get("randn_k")?,
             matmul: get("matmul_k")?,
+            axpy: get("axpy_k")?,
             sum_rows: get("sum_rows_k")?,
             sum_cols: get("sum_cols_k")?,
             sum_parts: get("sum_parts_k")?,
         };
-        Ok(Dev { dev, ctx, f, cache: Mutex::new(Cache::default()) })
+        // cuBLAS handles bind to the current context, so create it now that ours is current.
+        let blas = blas().and_then(|b| {
+            let mut h: Handle = std::ptr::null_mut();
+            (((b.create)(&mut h)) == 0).then(|| BlasHandle(Mutex::new(h as usize)))
+        });
+        Ok(Dev { dev, ctx, f, blas, cache: Mutex::new(Cache::default()) })
     }
 }
 
@@ -470,6 +554,75 @@ fn dims_of<'a>(d: &TensorDesc) -> (&'a [u64], &'a [u64]) {
     }
 }
 
+/// Row-major `out[m,n] = op(a) x op(b)` over contiguous stored matrices; `ta`/`tb` mean the stored
+/// matrix is the transpose of the operand (`a` is stored `[k,m]`, `b` is stored `[n,k]`).
+struct Gemm {
+    a: CuPtr,
+    b: CuPtr,
+    out: CuPtr,
+    m: u64,
+    n: u64,
+    k: u64,
+    ta: bool,
+    tb: bool,
+}
+
+fn gemm(drv: &Driver, dev: &Dev, g: Gemm) -> Result<(), E> {
+    let Gemm { a, b, out, m, n, k, ta, tb } = g;
+    if let (Some(bl), Some(h)) = (blas(), dev.blas.as_ref()) {
+        if m.max(n).max(k) <= i32::MAX as u64 {
+            // Row-major C = A*B is column-major C^T = B^T * A^T, so the operands swap. A row-major
+            // matrix read as column-major is already its transpose, so a stored operand needs the
+            // transpose flag exactly when the caller asked for the transposed one.
+            let (alpha, beta) = (1f32, 0f32);
+            let (op_b, op_a) = (tb as c_int, ta as c_int);
+            let ldb = if tb { k } else { n } as c_int;
+            let lda = if ta { m } else { k } as c_int;
+            let r = {
+                let hd = h.0.lock().unwrap_or_else(|p| p.into_inner());
+                unsafe {
+                    (bl.sgemm)(
+                        *hd as Handle, op_b, op_a, n as c_int, m as c_int, k as c_int, &alpha, b, ldb, a, lda, &beta, out,
+                        n as c_int,
+                    )
+                }
+            };
+            return if r == 0 { Ok(()) } else { err(STATUS_INTERNAL, format!("cublasSgemm failed with status {r}")) };
+        }
+    }
+    // Built-in kernel: contiguous row-major only, so materialize any transposed operand first.
+    let mut scratch: Vec<CuPtr> = Vec::new();
+    let mut transposed = |src: CuPtr, rows: u64, cols: u64| -> Result<CuPtr, E> {
+        // `src` is stored [rows, cols]; the copy is its transpose [cols, rows].
+        let t = dev.alloc(drv, (rows * cols * 4) as usize)?;
+        scratch.push(t);
+        let mut d = make_dims(&[cols, rows], &[1, cols])?;
+        let (mut inp, mut dst, mut nn, mut code) = (src, t, rows * cols, 7 as c_int);
+        drv.launch_1d(dev.f.unary, nn, &mut [p(&mut code), p(&mut inp), p(&mut dst), p(&mut nn), p(&mut d)], "transpose")?;
+        Ok(t)
+    };
+    let res = (|| {
+        let mut a = if ta { transposed(a, k, m)? } else { a };
+        let mut b = if tb { transposed(b, n, k)? } else { b };
+        let (mut mm, mut kk, mut nn, mut out) = (m, k, n, out);
+        let (gx, gy) = (n.div_ceil(128) as u32, m.div_ceil(128) as u32);
+        if gy > 65535 || gx == 0 {
+            return err(STATUS_UNSUPPORTED, "matmul too large");
+        }
+        // 16x16 thread block: launch with block (16,16,1) via grid/block override.
+        let r = unsafe {
+            let mut params = [p(&mut a), p(&mut b), p(&mut out), p(&mut mm), p(&mut nn), p(&mut kk)];
+            (drv.launch)(dev.f.matmul, gx, gy, 1, 16, 16, 1, 0, std::ptr::null_mut(), params.as_mut_ptr(), std::ptr::null_mut())
+        };
+        drv.check(r, "launch matmul")
+    })();
+    // Stream ordering makes it safe to recycle the scratch right away.
+    for t in scratch {
+        dev.release(t);
+    }
+    res
+}
+
 fn run(device: u32, op_code: u32, attrs: &OpAttrs, ins: &[TensorDesc], outs: &[TensorDesc]) -> Result<(), E> {
     use op::*;
     let (drv, dev) = enter(device)?;
@@ -478,7 +631,7 @@ fn run(device: u32, op_code: u32, attrs: &OpAttrs, ins: &[TensorDesc], outs: &[T
     }
     let need = match op_code {
         NEG | EXP | LOG | RELU | TANH | STEP | COPY => 1,
-        ADD | SUB | MUL | DIV | MATMUL => 2,
+        ADD | SUB | MUL | DIV | MATMUL | MATMUL_T | AXPY => 2,
         SUM_AXIS => 1,
         FILL | RAND_NORMAL => 0,
         _ => return err(STATUS_UNSUPPORTED, format!("unsupported op {op_code}")),
@@ -526,6 +679,11 @@ fn run(device: u32, op_code: u32, attrs: &OpAttrs, ins: &[TensorDesc], outs: &[T
             let (mut da, mut db) = (make_dims(sa, sta)?, make_dims(sb, stb)?);
             let (mut a, mut b) = (ins[0].data as usize as CuPtr, ins[1].data as usize as CuPtr);
             let mut code: c_int = (op_code - ADD) as c_int;
+            // Contiguous same-shape operands with aligned pointers take the 128-bit path.
+            if da.contig == 1 && db.contig == 1 && n % 4 == 0 && (a | b | out) % 16 == 0 {
+                let mut n4 = n / 4;
+                return drv.launch_1d(f.binary_vec, n4, &mut [p(&mut code), p(&mut a), p(&mut b), p(&mut out), p(&mut n4)], "binary_vec");
+            }
             drv.launch_1d(
                 f.binary,
                 n,
@@ -533,25 +691,31 @@ fn run(device: u32, op_code: u32, attrs: &OpAttrs, ins: &[TensorDesc], outs: &[T
                 "binary",
             )
         }
-        MATMUL => {
+        MATMUL | MATMUL_T => {
+            let flags = if op_code == MATMUL_T { attrs.ints[0] } else { 0 };
+            let (ta, tb) = (flags & 1 != 0, flags & 2 != 0);
             let (sa, _) = dims_of(&ins[0]);
             let (sb, _) = dims_of(&ins[1]);
-            if sa.len() != 2 || sb.len() != 2 || sa[1] != sb[0] || n != sa[0] * sb[1] {
+            if sa.len() != 2 || sb.len() != 2 {
+                return err(STATUS_INVALID_ARGUMENT, "matmul needs 2-D inputs");
+            }
+            let (m, k) = if ta { (sa[1], sa[0]) } else { (sa[0], sa[1]) };
+            let (kb, nc) = if tb { (sb[1], sb[0]) } else { (sb[0], sb[1]) };
+            if k != kb || n != m * nc {
                 return err(STATUS_INVALID_ARGUMENT, "matmul shape mismatch");
             }
-            let (mut m, mut k, mut nc) = (sa[0], sa[1], sb[1]);
-            let (mut a, mut b) = (ins[0].data as usize as CuPtr, ins[1].data as usize as CuPtr);
-            let grid = (nc.div_ceil(128) as u32, m.div_ceil(128) as u32);
-            let (gx, gy) = grid;
-            if gy > 65535 || gx == 0 {
-                return err(STATUS_UNSUPPORTED, "matmul too large");
+            let (a, b) = (ins[0].data as usize as CuPtr, ins[1].data as usize as CuPtr);
+            gemm(drv, &dev, Gemm { a, b, out, m, n: nc, k, ta, tb })
+        }
+        AXPY => {
+            let (sa, _) = dims_of(&ins[0]);
+            let (sb, _) = dims_of(&ins[1]);
+            if numel(sa) != n || numel(sb) != n {
+                return err(STATUS_INVALID_ARGUMENT, "axpy input shapes do not match output");
             }
-            // 16x16 thread block: launch with block (16,16,1) via grid/block override.
-            let r = unsafe {
-                let mut params = [p(&mut a), p(&mut b), p(&mut out), p(&mut m), p(&mut nc), p(&mut k)];
-                (drv.launch)(f.matmul, gx, gy, 1, 16, 16, 1, 0, std::ptr::null_mut(), params.as_mut_ptr(), std::ptr::null_mut())
-            };
-            drv.check(r, "launch matmul")
+            let (mut a, mut b) = (ins[0].data as usize as CuPtr, ins[1].data as usize as CuPtr);
+            let mut alpha = f32::from_bits(attrs.ints[0] as u32);
+            drv.launch_1d(f.axpy, n, &mut [p(&mut a), p(&mut b), p(&mut out), p(&mut nn), p(&mut alpha)], "axpy")
         }
         SUM_AXIS => {
             let (shape, _) = dims_of(&ins[0]);
@@ -578,6 +742,10 @@ fn run(device: u32, op_code: u32, attrs: &OpAttrs, ins: &[TensorDesc], outs: &[T
                 let np = if total >= 32768 || len <= 64 { 1 } else { (131072 / total).clamp(1, len.div_ceil(32)).min(4096) };
                 (np, len.div_ceil(np))
             };
+            // Rows that are a multiple of 4 floats, 16-byte aligned, can be read as float4: keep every
+            // chunk a multiple of 4 too so each chunk start stays aligned.
+            let mut vec: c_int = (inner == 1 && len % 4 == 0 && x % 16 == 0) as c_int;
+            let chunk = if vec == 1 { chunk.next_multiple_of(4) } else { chunk };
             let parts = len.div_ceil(chunk).min(parts).max(1);
             let mut chunk_v = chunk;
             let scratch = if parts > 1 { Some(dev.alloc(drv, (parts * total * 4) as usize)?) } else { None };
@@ -588,7 +756,7 @@ fn run(device: u32, op_code: u32, attrs: &OpAttrs, ins: &[TensorDesc], outs: &[T
                         f.sum_rows,
                         (outer as u32, parts as u32),
                         256,
-                        &mut [p(&mut x), p(&mut dst), p(&mut outer), p(&mut len), p(&mut chunk_v)],
+                        &mut [p(&mut x), p(&mut dst), p(&mut outer), p(&mut len), p(&mut chunk_v), p(&mut vec)],
                         "sum_rows",
                     )
                 } else {
@@ -622,7 +790,7 @@ unsafe extern "C" fn supports_op(code: u32) -> u32 {
     use op::*;
     matches!(
         code,
-        NEG | EXP | LOG | RELU | TANH | STEP | ADD | SUB | MUL | DIV | MATMUL | SUM_AXIS | COPY | FILL | RAND_NORMAL
+        NEG | EXP | LOG | RELU | TANH | STEP | ADD | SUB | MUL | DIV | MATMUL | MATMUL_T | AXPY | SUM_AXIS | COPY | FILL | RAND_NORMAL
     ) as u32
 }
 

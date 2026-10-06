@@ -142,6 +142,72 @@ fn matmul_sizes() {
 }
 
 #[test]
+fn matmul_gradients_odd_shapes() {
+    // Backward uses MATMUL_T (transposed operands), so check non-square shapes where a wrong flag or
+    // leading dimension cannot cancel out. Both inputs need gradients here.
+    let (cpu, gpu) = need_cuda!();
+    for (m, k, n) in [(33, 65, 17), (1, 1, 1), (5, 129, 130), (7, 300, 1), (1, 40, 64)] {
+        let run = |dev: &Device| {
+            let mk = |shape: &[usize], seed| Tensor::from_vec_on(data(shape.iter().product(), seed), shape.to_vec(), dev);
+            let (a, b, w) = (mk(&[m, k], 1).requires_grad_(true), mk(&[k, n], 2).requires_grad_(true), mk(&[m, n], 3));
+            a.matmul(&b).mul(&w).sum().backward();
+            vec![a.grad().unwrap().to_vec(), b.grad().unwrap().to_vec()]
+        };
+        let (c, g) = (run(&cpu), run(&gpu));
+        assert_close(&format!("grad_a {m}x{k}x{n}"), &g[0], &c[0], 2e-4);
+        assert_close(&format!("grad_b {m}x{k}x{n}"), &g[1], &c[1], 2e-4);
+    }
+}
+
+#[test]
+fn matmul_skips_unneeded_gradient() {
+    let (_, gpu) = need_cuda!();
+    let x = Tensor::from_vec_on(data(6, 1), vec![2, 3], &gpu);
+    let w = Tensor::from_vec_on(data(12, 2), vec![3, 4], &gpu).requires_grad_(true);
+    x.matmul(&w).sum().backward();
+    assert!(w.grad().is_some());
+    assert!(x.grad().is_none());
+}
+
+#[test]
+fn axpy_in_place() {
+    let (cpu, gpu) = need_cuda!();
+    for n in [1usize, 255, 4097, 1 << 20] {
+        let (ac, ag) = pair(&[n], 1, &cpu, &gpu);
+        let (bc, bg) = pair(&[n], 2, &cpu, &gpu);
+        ac.axpy_(-0.25, &bc);
+        ag.axpy_(-0.25, &bg);
+        assert_close(&format!("axpy n={n}"), &ag.to_vec(), &ac.to_vec(), 1e-6);
+    }
+}
+
+#[test]
+fn vectorized_paths_match_cpu() {
+    // The 128-bit binary and row-sum kernels only run for lengths that are a multiple of 4; check both
+    // sides of that boundary, single-chunk and many-chunk reductions, and 2-D rows.
+    let (cpu, gpu) = need_cuda!();
+    for n in [4usize, 7, 8, 1000, 4096, 4100, 65537, 1 << 20, (1 << 22) + 4, (1 << 22) + 3] {
+        let (ac, ag) = pair(&[n], 1, &cpu, &gpu);
+        let (bc, bg) = pair(&[n], 2, &cpu, &gpu);
+        assert_close(&format!("add n={n}"), &ag.add(&bg).to_vec(), &ac.add(&bc).to_vec(), 1e-6);
+        assert_close(&format!("div n={n}"), &ag.div(&bg.add(&bg.mul(&bg)).add(&Tensor::scalar_on(2.0, &gpu))).to_vec(),
+            &ac.div(&bc.add(&bc.mul(&bc)).add(&Tensor::scalar_on(2.0, &cpu))).to_vec(), 1e-5);
+        assert_close(&format!("sum n={n}"), &ag.sum().to_vec(), &ac.sum().to_vec(), 1e-3);
+    }
+    // d/d(bias[r]) of sum(w * (x + bias)) is the row sum of w, reduced over the last axis (inner == 1).
+    for (rows, cols) in [(3usize, 8usize), (5, 6), (256, 4096), (300, 1000), (1, 1 << 16)] {
+        let run = |dev: &Device| {
+            let mk = |shape: &[usize], seed| Tensor::from_vec_on(data(shape.iter().product(), seed), shape.to_vec(), dev);
+            let (x, w) = (mk(&[rows, cols], 3), mk(&[rows, cols], 4));
+            let bias = mk(&[rows, 1], 5).requires_grad_(true);
+            x.add(&bias).mul(&w).sum().backward();
+            bias.grad().unwrap().to_vec()
+        };
+        assert_close(&format!("rowsum {rows}x{cols}"), &run(&gpu), &run(&cpu), 1e-3);
+    }
+}
+
+#[test]
 fn sums_and_means() {
     let (cpu, gpu) = need_cuda!();
     // sum() reduces a flat tensor (inner == 1); big ones exercise the multi-block path.

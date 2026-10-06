@@ -65,6 +65,29 @@ extern "C" __global__ void binary_k(int op, const float* __restrict__ a, const f
     }
 }
 
+// Contiguous same-shape binary op over 128-bit vectors. Launched only when n % 4 == 0 and all three
+// pointers are 16-byte aligned; everything else goes through binary_k.
+extern "C" __global__ void binary_vec_k(int op, const float4* __restrict__ a, const float4* __restrict__ b,
+                                        float4* __restrict__ out, u64 n4) {
+    u64 stride = (u64)gridDim.x * blockDim.x;
+    for (u64 i = (u64)blockIdx.x * blockDim.x + threadIdx.x; i < n4; i += stride) {
+        float4 x = a[i], y = b[i], r;
+        switch (op) {
+            case B_ADD: r = make_float4(x.x + y.x, x.y + y.y, x.z + y.z, x.w + y.w); break;
+            case B_SUB: r = make_float4(x.x - y.x, x.y - y.y, x.z - y.z, x.w - y.w); break;
+            case B_MUL: r = make_float4(x.x * y.x, x.y * y.y, x.z * y.z, x.w * y.w); break;
+            default: r = make_float4(x.x / y.x, x.y / y.y, x.z / y.z, x.w / y.w); break;
+        }
+        out[i] = r;
+    }
+}
+
+// out = a + alpha * b. `out` may alias `a` (in-place update), so no __restrict__ on those two.
+extern "C" __global__ void axpy_k(const float* a, const float* __restrict__ b, float* out, u64 n, float alpha) {
+    u64 stride = (u64)gridDim.x * blockDim.x;
+    for (u64 i = (u64)blockIdx.x * blockDim.x + threadIdx.x; i < n; i += stride) out[i] = a[i] + alpha * b[i];
+}
+
 extern "C" __global__ void fill_k(float* __restrict__ out, u64 n, float v) {
     u64 stride = (u64)gridDim.x * blockDim.x;
     for (u64 i = (u64)blockIdx.x * blockDim.x + threadIdx.x; i < n; i += stride) out[i] = v;
@@ -174,13 +197,24 @@ __device__ __forceinline__ float block_reduce_sum(float v) {
 
 // inner == 1: row o of x[outer][n]; blockIdx.x = row, blockIdx.y = chunk of the row.
 // Writes dst[chunk * outer + row] (dst is `out` directly when gridDim.y == 1).
-extern "C" __global__ void sum_rows_k(const float* __restrict__ x, float* __restrict__ dst, u64 outer, u64 n, u64 chunk) {
+extern "C" __global__ void sum_rows_k(const float* __restrict__ x, float* __restrict__ dst, u64 outer, u64 n, u64 chunk,
+                                       int vec) {
     u64 row = blockIdx.x;
     u64 begin = (u64)blockIdx.y * chunk;
     u64 end = begin + chunk < n ? begin + chunk : n;
     const float* p = x + row * n;
     float s = 0.0f;
-    for (u64 j = begin + threadIdx.x; j < end; j += blockDim.x) s += p[j];
+    if (vec) {
+        // Host guarantees n % 4 == 0, chunk % 4 == 0 and a 16-byte aligned x, so every row and chunk
+        // start is aligned and `begin`/`end` are multiples of 4 (end == n when it is clamped).
+        const float4* p4 = reinterpret_cast<const float4*>(p);
+        for (u64 j = begin / 4 + threadIdx.x; j < end / 4; j += blockDim.x) {
+            float4 v = p4[j];
+            s += (v.x + v.y) + (v.z + v.w);
+        }
+    } else {
+        for (u64 j = begin + threadIdx.x; j < end; j += blockDim.x) s += p[j];
+    }
     s = block_reduce_sum(s);
     if (threadIdx.x == 0) dst[(u64)blockIdx.y * outer + row] = s;
 }
