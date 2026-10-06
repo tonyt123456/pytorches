@@ -4,7 +4,7 @@ use libloading::Library;
 use pytorches_plugin_abi::*;
 use std::ffi::{CStr, c_char};
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, RwLock};
+use std::sync::{Arc, Mutex, RwLock};
 
 /// A loaded plugin. Plugins are never unloaded, so the vtable reference is `'static`.
 pub struct Plugin {
@@ -31,6 +31,15 @@ impl Plugin {
 }
 
 static REGISTRY: RwLock<Vec<Arc<Plugin>>> = RwLock::new(Vec::new());
+
+/// One entry per candidate library from the most recent [`discover`] call.
+pub type DiscoveryReport = Vec<(PathBuf, Result<String, String>)>;
+static LAST_DISCOVERY: Mutex<DiscoveryReport> = Mutex::new(Vec::new());
+
+/// What the last [`discover`] call tried: each library and whether it loaded (plugin name) or why not.
+pub fn discovery_report() -> DiscoveryReport {
+    LAST_DISCOVERY.lock().unwrap().clone()
+}
 
 pub fn plugins() -> Vec<Arc<Plugin>> {
     REGISTRY.read().unwrap().clone()
@@ -105,7 +114,7 @@ pub fn load_plugin_dir(dir: &Path) -> Vec<(PathBuf, Result<String, String>)> {
 
 /// Loads plugins from `$PYTORCHES_PLUGIN_DIR` (if set), else `./plugins/bin`, else
 /// `<exe dir>/plugins`. Safe to call repeatedly.
-pub fn discover() -> Vec<(PathBuf, Result<String, String>)> {
+pub fn discover() -> DiscoveryReport {
     let mut dirs: Vec<PathBuf> = Vec::new();
     if let Some(d) = std::env::var_os("PYTORCHES_PLUGIN_DIR") {
         dirs.extend(std::env::split_paths(&d));
@@ -115,5 +124,7 @@ pub fn discover() -> Vec<(PathBuf, Result<String, String>)> {
             dirs.push(exe_dir.join("plugins"));
         }
     }
-    dirs.iter().flat_map(|d| load_plugin_dir(d)).collect()
+    let report: DiscoveryReport = dirs.iter().flat_map(|d| load_plugin_dir(d)).collect();
+    *LAST_DISCOVERY.lock().unwrap() = report.clone();
+    report
 }

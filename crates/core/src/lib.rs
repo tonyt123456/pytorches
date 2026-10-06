@@ -7,6 +7,7 @@
 //! Current scope: `f32`, contiguous tensors. Broadcasting and transposes are expressed
 //! as strided operands at dispatch time rather than as stored views.
 
+pub mod plan;
 pub mod plugin;
 
 use plugin::Plugin;
@@ -216,6 +217,13 @@ impl<'a> Operand<'a> {
 }
 
 fn run_op(device: &Device, code: u32, ints: [i64; 4], ins: &[Operand], out_shape: &[usize]) -> Tensor {
+    let out_buf = Arc::new(Buffer::alloc(device, out_shape.iter().product()));
+    run_op_into(device, code, ints, ins, &out_buf, out_shape);
+    Tensor::build(out_buf, out_shape.to_vec(), false, None)
+}
+
+/// Runs one op, writing the (contiguous) result into an existing buffer.
+fn run_op_into(device: &Device, code: u32, ints: [i64; 4], ins: &[Operand], out_buf: &Arc<Buffer>, out_shape: &[usize]) {
     let vt = device.plugin.vt;
     assert!(
         unsafe { (vt.supports_op)(code) } != 0,
@@ -225,7 +233,7 @@ fn run_op(device: &Device, code: u32, ints: [i64; 4], ins: &[Operand], out_shape
     for o in ins {
         assert!(&o.t.device() == device, "tensors on different devices: {} and {device}", o.t.device());
     }
-    let out_buf = Arc::new(Buffer::alloc(device, out_shape.iter().product()));
+    assert!(&out_buf.device == device, "output buffer is on {}, op runs on {device}", out_buf.device);
 
     let to_u64 = |v: &[usize]| v.iter().map(|&x| x as u64).collect::<Vec<u64>>();
     // Keep the dimension arrays alive until after the call.
@@ -247,7 +255,6 @@ fn run_op(device: &Device, code: u32, ints: [i64; 4], ins: &[Operand], out_shape
         (vt.execute)(device.index, code, &attrs, in_descs.as_ptr(), in_descs.len() as u32, &out_desc, 1)
     };
     assert_eq!(status, abi::STATUS_OK, "op {code} failed on {device}: {}", device.plugin.last_error());
-    Tensor::build(out_buf, out_shape.to_vec(), false, None)
 }
 
 impl Tensor {
@@ -273,15 +280,26 @@ impl Tensor {
     }
 
     pub fn scalar_on(v: f32, device: &Device) -> Self {
-        Self::from_vec_on(vec![v], vec![], device)
+        Self::full_on(&[], v, device)
+    }
+
+    /// Constant-filled tensor, created directly on the device (no host staging).
+    pub fn full_on(shape: &[usize], value: f32, device: &Device) -> Self {
+        run_op(device, op::FILL, [value.to_bits() as i64, 0, 0, 0], &[], shape)
     }
 
     pub fn ones_on(shape: &[usize], device: &Device) -> Self {
-        Self::from_vec_on(vec![1.0; shape.iter().product()], shape.to_vec(), device)
+        Self::full_on(shape, 1.0, device)
     }
 
     pub fn zeros_on(shape: &[usize], device: &Device) -> Self {
-        Self::from_vec_on(vec![0.0; shape.iter().product()], shape.to_vec(), device)
+        Self::full_on(shape, 0.0, device)
+    }
+
+    /// N(0,1) samples generated on the device. Same seed gives the same values on every device
+    /// (up to float rounding in `ln`/`cos`).
+    pub fn randn_on(shape: &[usize], seed: u64, device: &Device) -> Self {
+        run_op(device, op::RAND_NORMAL, [seed as i64, 0, 0, 0], &[], shape)
     }
 
     /// A leaf tensor sharing this tensor's storage with the given `requires_grad`.
@@ -318,6 +336,20 @@ impl Tensor {
 
     pub fn device(&self) -> Device {
         self.0.data.device.clone()
+    }
+
+    /// Size of the tensor's storage in bytes.
+    pub fn nbytes(&self) -> usize {
+        self.numel() * 4
+    }
+
+    /// In-place overwrite with `src` (same shape; `src` is moved to this device if needed).
+    /// Not tracked by autograd. Storage shared with `detach()` copies sees the change.
+    pub fn copy_(&self, src: &Tensor) {
+        assert_eq!(self.shape(), src.shape(), "copy_ shape mismatch: {:?} vs {:?}", self.shape(), src.shape());
+        let dev = self.device();
+        let src = src.to(&dev);
+        run_op_into(&dev, op::COPY, [0; 4], &[Operand::contiguous(&src)], &self.0.data, self.shape());
     }
 
     /// Copies the data to the host.
@@ -670,6 +702,51 @@ mod tests {
         init();
         let x = Tensor::new(vec![1.0], vec![1]);
         assert!(!(&x * &x).requires_grad());
+    }
+
+    #[test]
+    fn fill_and_copy_in_place() {
+        init();
+        let dev = Device::default_device();
+        let t = Tensor::full_on(&[2, 2], 7.0, &dev);
+        assert_eq!(t.to_vec(), vec![7.0; 4]);
+        let alias = t.detach(); // shares storage
+        t.copy_(&Tensor::new(vec![1.0, 2.0, 3.0, 4.0], vec![2, 2]));
+        assert_eq!(alias.to_vec(), vec![1.0, 2.0, 3.0, 4.0]);
+        assert_eq!(Tensor::zeros_on(&[3], &dev).to_vec(), vec![0.0; 3]);
+    }
+
+    #[test]
+    fn randn_is_deterministic_and_normal() {
+        init();
+        let dev = Device::default_device();
+        let a = Tensor::randn_on(&[100_000], 42, &dev).to_vec();
+        assert_eq!(a, Tensor::randn_on(&[100_000], 42, &dev).to_vec());
+        assert_ne!(a, Tensor::randn_on(&[100_000], 43, &dev).to_vec());
+        let n = a.len() as f32;
+        let mean = a.iter().sum::<f32>() / n;
+        let var = a.iter().map(|v| (v - mean) * (v - mean)).sum::<f32>() / n;
+        assert!(mean.abs() < 0.02, "mean {mean}");
+        assert!((var - 1.0).abs() < 0.03, "var {var}");
+    }
+
+    #[test]
+    fn randn_golden_values() {
+        // Pins the cross-device RNG recipe; GPU plugins must match these (within float tolerance).
+        init();
+        let v = Tensor::randn_on(&[4], 1234, &Device::default_device()).to_vec();
+        for (got, want) in v.iter().zip([0.6574781f32, -0.08203645, -2.2065563, 0.70945626]) {
+            assert!((got - want).abs() < 1e-5, "{v:?}");
+        }
+    }
+
+    #[test]
+    fn plan_with_cpu_only_picks_cpu() {
+        init();
+        let p = plan::plan(1 << 20);
+        assert_eq!(p.chosen.to_string(), "cpu:0");
+        assert!(!p.may_oom);
+        assert!(p.candidates[0].gflops > 0.0);
     }
 
     #[test]

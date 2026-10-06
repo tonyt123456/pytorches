@@ -15,6 +15,11 @@
 //!   stride 0 for broadcasting), outputs are always contiguous.
 //! * `execute` must not panic/unwind across the boundary; return a [`Status`] instead.
 //! * All entry points may be called from any thread.
+//! * Execution model: every call enqueues work on the device's implicit default stream, in
+//!   order. `execute` and the `copy_*` entry points that write device memory may return before
+//!   the work finishes. `copy_to_host` and `synchronize` block until the data/device is ready.
+//!   `free` must be safe while earlier work that uses the buffer is still in flight.
+//!   (Explicit streams can be added later as appended fields.)
 //!
 //! Adding ops or fields in a backward-compatible way means appending to the op list or
 //! bumping `ABI_VERSION`; plugins advertise which ops they implement via `supports_op`.
@@ -22,7 +27,7 @@
 
 use core::ffi::{c_char, c_void};
 
-pub const ABI_VERSION: u32 = 1;
+pub const ABI_VERSION: u32 = 2;
 /// NUL-terminated name of the exported entry function (`EntryFn`).
 pub const ENTRY_SYMBOL: &[u8] = b"pytorches_plugin_entry\0";
 /// Required file-name prefix for plugin libraries in the plugin directory.
@@ -70,6 +75,20 @@ pub mod op {
 
     /// Materialize a (possibly strided / broadcast) input into a contiguous output.
     pub const COPY: u32 = 300;
+
+    /// Fill the output with a constant. No inputs. `attrs.ints[0]` is the f32 bit pattern
+    /// (`f32::to_bits() as i64`).
+    pub const FILL: u32 = 400;
+    /// Fill the output with N(0,1) samples. No inputs. `attrs.ints[0]` is the seed.
+    ///
+    /// Counter-based so every device can produce the same stream: for element index `i` (u64):
+    /// `h = splitmix64(seed as u64 ^ i.wrapping_mul(0x9E3779B97F4A7C15))`,
+    /// `u1 = ((h >> 40) + 1) as f32 / 16777216.0` (in (0,1]),
+    /// `u2 = (h & 0xFFFFFF) as f32 / 16777216.0` (in [0,1)),
+    /// `out = sqrt(-2 ln u1) * cos(2 pi u2)`.
+    /// where `splitmix64(x)`: `x += 0x9E3779B97F4A7C15; x = (x ^ (x>>30)) * 0xBF58476D1CE4E5B9;
+    /// x = (x ^ (x>>27)) * 0x94D049BB133111EB; x ^ (x>>31)` (wrapping u64 arithmetic).
+    pub const RAND_NORMAL: u32 = 401;
 }
 
 /// A tensor argument. `shape` and `strides` point to `ndim` entries; strides are in elements.
@@ -117,6 +136,9 @@ pub struct PluginVTable {
     pub copy_from_host:
         unsafe extern "C" fn(device: u32, dst: *mut c_void, src: *const c_void, bytes: usize) -> Status,
     pub copy_to_host:
+        unsafe extern "C" fn(device: u32, dst: *mut c_void, src: *const c_void, bytes: usize) -> Status,
+    /// Copy within one device (both pointers from this plugin and `device`). Ranges must not overlap.
+    pub copy_device_to_device:
         unsafe extern "C" fn(device: u32, dst: *mut c_void, src: *const c_void, bytes: usize) -> Status,
 
     /// Nonzero if `execute` implements `op`.

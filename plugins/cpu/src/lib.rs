@@ -52,21 +52,73 @@ unsafe extern "C" fn copy_to_host(_d: u32, dst: *mut c_void, src: *const c_void,
     STATUS_OK
 }
 
+unsafe extern "C" fn copy_d2d(_d: u32, dst: *mut c_void, src: *const c_void, bytes: usize) -> Status {
+    unsafe { std::ptr::copy_nonoverlapping(src as *const u8, dst as *mut u8, bytes) };
+    STATUS_OK
+}
+
 // ---- device info ------------------------------------------------------------
 
 unsafe extern "C" fn device_count() -> u32 {
     1
 }
 
+/// (total, available) system memory in bytes, if the OS will tell us.
+#[cfg(windows)]
+fn host_memory() -> Option<(u64, u64)> {
+    #[repr(C)]
+    struct MemoryStatusEx {
+        length: u32,
+        memory_load: u32,
+        total_phys: u64,
+        avail_phys: u64,
+        total_page_file: u64,
+        avail_page_file: u64,
+        total_virtual: u64,
+        avail_virtual: u64,
+        avail_extended_virtual: u64,
+    }
+    unsafe extern "system" {
+        fn GlobalMemoryStatusEx(buf: *mut MemoryStatusEx) -> i32;
+    }
+    let mut m = MemoryStatusEx {
+        length: std::mem::size_of::<MemoryStatusEx>() as u32,
+        memory_load: 0,
+        total_phys: 0,
+        avail_phys: 0,
+        total_page_file: 0,
+        avail_page_file: 0,
+        total_virtual: 0,
+        avail_virtual: 0,
+        avail_extended_virtual: 0,
+    };
+    (unsafe { GlobalMemoryStatusEx(&mut m) } != 0).then_some((m.total_phys, m.avail_phys))
+}
+
+#[cfg(target_os = "linux")]
+fn host_memory() -> Option<(u64, u64)> {
+    let text = std::fs::read_to_string("/proc/meminfo").ok()?;
+    let kb = |key: &str| -> Option<u64> {
+        text.lines().find(|l| l.starts_with(key))?.split_whitespace().nth(1)?.parse::<u64>().ok().map(|v| v * 1024)
+    };
+    Some((kb("MemTotal:")?, kb("MemAvailable:")?))
+}
+
+#[cfg(not(any(windows, target_os = "linux")))]
+fn host_memory() -> Option<(u64, u64)> {
+    None
+}
+
 unsafe extern "C" fn device_info(device: u32, out: *mut DeviceInfo) -> Status {
     if device != 0 || out.is_null() {
         return STATUS_INVALID_ARGUMENT;
     }
+    let (total, free) = host_memory().unwrap_or((MEMORY_UNKNOWN, MEMORY_UNKNOWN));
     let mut info = DeviceInfo {
         name: [0; 64],
         kind: KIND_CPU,
-        total_memory: MEMORY_UNKNOWN,
-        free_memory: MEMORY_UNKNOWN,
+        total_memory: total,
+        free_memory: free,
     };
     for (dst, &b) in info.name.iter_mut().zip(b"cpu") {
         *dst = b as c_char;
@@ -87,7 +139,10 @@ unsafe extern "C" fn last_error() -> *const c_char {
 
 unsafe extern "C" fn supports_op(code: u32) -> u32 {
     use op::*;
-    matches!(code, NEG | EXP | LOG | RELU | TANH | STEP | ADD | SUB | MUL | DIV | MATMUL | SUM_AXIS | COPY) as u32
+    matches!(
+        code,
+        NEG | EXP | LOG | RELU | TANH | STEP | ADD | SUB | MUL | DIV | MATMUL | SUM_AXIS | COPY | FILL | RAND_NORMAL
+    ) as u32
 }
 
 unsafe fn dims<'a>(d: &TensorDesc) -> (&'a [u64], &'a [u64]) {
@@ -149,6 +204,21 @@ unsafe fn write<'a>(d: &TensorDesc) -> &'a mut [f32] {
     }
 }
 
+fn splitmix64(mut x: u64) -> u64 {
+    x = x.wrapping_add(0x9E37_79B9_7F4A_7C15);
+    x = (x ^ (x >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+    x = (x ^ (x >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+    x ^ (x >> 31)
+}
+
+/// Counter-based N(0,1); the exact recipe is specified in `pytorches_plugin_abi::op::RAND_NORMAL`.
+fn rand_normal(seed: u64, i: u64) -> f32 {
+    let h = splitmix64(seed ^ i.wrapping_mul(0x9E37_79B9_7F4A_7C15));
+    let u1 = ((h >> 40) + 1) as f32 / 16777216.0;
+    let u2 = (h & 0xFF_FFFF) as f32 / 16777216.0;
+    (-2.0 * u1.ln()).sqrt() * (2.0 * std::f32::consts::PI * u2).cos()
+}
+
 unsafe fn run(op_code: u32, attrs: &OpAttrs, ins: &[TensorDesc], outs: &[TensorDesc]) -> Status {
     use op::*;
     if outs.len() != 1 {
@@ -157,6 +227,13 @@ unsafe fn run(op_code: u32, attrs: &OpAttrs, ins: &[TensorDesc], outs: &[TensorD
     unsafe {
         let out = write(&outs[0]);
         match op_code {
+            FILL => out.fill(f32::from_bits(attrs.ints[0] as u32)),
+            RAND_NORMAL => {
+                let seed = attrs.ints[0] as u64;
+                for (i, o) in out.iter_mut().enumerate() {
+                    *o = rand_normal(seed, i as u64);
+                }
+            }
             NEG | EXP | LOG | RELU | TANH | STEP | COPY => {
                 let x = read(&ins[0]);
                 let f: fn(f32) -> f32 = match op_code {
@@ -258,6 +335,7 @@ static VTABLE: PluginVTable = PluginVTable {
     free: free_buf,
     copy_from_host,
     copy_to_host,
+    copy_device_to_device: copy_d2d,
     supports_op,
     execute,
     synchronize,
