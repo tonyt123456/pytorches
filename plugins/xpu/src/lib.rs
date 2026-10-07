@@ -352,6 +352,7 @@ const KERNEL_NAMES: &[&str] = &[
     "binary_flat",
     "binary_strided",
     "axpy",
+    "transpose2d",
     "fill",
     "rand_normal",
     "matmul",
@@ -833,6 +834,20 @@ unsafe fn run(device: u32, op_code: u32, attrs: &OpAttrs, ins: &[T], outs: &[T])
                 if x.shape != out.shape {
                     return fail(STATUS_INVALID_ARGUMENT, "unary input/output shape mismatch");
                 }
+                // A COPY that is exactly a 2-D transpose of a contiguous matrix (what `Tensor::t` and the
+                // matmul backward produce) takes the tiled kernel instead of the generic strided one.
+                if op_code == COPY && x.shape.len() == 2 && x.strides[0] == 1 && x.strides[1] == x.shape[0] && x.shape[0] > 1 && x.shape[1] > 1 {
+                    let (c, r) = (x.shape[0], x.shape[1]); // source is [r, c]; output is [c, r]
+                    return launch(
+                        g,
+                        d,
+                        st,
+                        "transpose2d",
+                        &[Arg::Mem(x.data), Arg::Mem(out.data), Arg::U64(r), Arg::U64(c)],
+                        &[c.div_ceil(32) as usize * 32, r.div_ceil(32) as usize * 8],
+                        Some(&[32, 8]),
+                    );
+                }
                 let code = if op_code == COPY { 0 } else { op_code as i32 };
                 let p = plan(&x.shape, &[&x.strides])?;
                 if p.flat {
@@ -933,26 +948,34 @@ unsafe fn run(device: u32, op_code: u32, attrs: &OpAttrs, ins: &[T], outs: &[T])
                 if m == 0 || nn == 0 {
                     return Ok(());
                 }
-                // Sub-group fast path for tile-friendly shapes (see kernels.cl), when the driver has it.
-                if m % 16 == 0 && nn % 32 == 0 && k % 16 == 0 && k > 0 && st.kernels.as_ref().unwrap().contains_key("matmul_sg") {
-                    return launch(
+                // Sub-group fast path (see kernels.cl) for N % 32 == 0 and K % 16 == 0 on whole 16-row
+                // blocks, when the driver has it. Leftover rows (m % 16) use the general kernel.
+                let mut done = 0u64;
+                if nn % 32 == 0 && k % 16 == 0 && k > 0 && m >= 16 && st.kernels.as_ref().unwrap().contains_key("matmul_sg") {
+                    let fast = m / 16 * 16;
+                    launch(
                         g,
                         d,
                         st,
                         "matmul_sg",
-                        &[Arg::Mem(a.data), Arg::Mem(b.data), Arg::Mem(out.data), Arg::U64(m), Arg::U64(nn), Arg::U64(k)],
-                        &[(nn / 32) as usize * 16, (m / 16) as usize],
+                        &[Arg::Mem(a.data), Arg::Mem(b.data), Arg::Mem(out.data), Arg::U64(fast), Arg::U64(nn), Arg::U64(k)],
+                        &[(nn / 32) as usize * 16, (fast / 16) as usize],
                         Some(&[16, 1]),
-                    );
+                    )?;
+                    done = fast;
+                }
+                let rest = m - done;
+                if rest == 0 {
+                    return Ok(());
                 }
                 let gx = nn.div_ceil(64) as usize * 16;
-                let gy = m.div_ceil(64) as usize * 16;
+                let gy = rest.div_ceil(64) as usize * 16;
                 launch(
                     g,
                     d,
                     st,
                     "matmul",
-                    &[Arg::Mem(a.data), Arg::Mem(b.data), Arg::Mem(out.data), Arg::U64(m), Arg::U64(nn), Arg::U64(k)],
+                    &[Arg::Mem(a.data), Arg::Mem(b.data), Arg::Mem(out.data), Arg::U64(rest), Arg::U64(nn), Arg::U64(k), Arg::U64(done)],
                     &[gx, gy],
                     Some(&[16, 16]),
                 )

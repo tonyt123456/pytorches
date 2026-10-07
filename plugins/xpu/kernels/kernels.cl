@@ -81,6 +81,25 @@ __kernel void binary_strided(__global const float* a, __global const float* b, _
         y[i] = bi(op, a[offs(i, &da, use32)], b[offs(i, &db, use32)]);
 }
 
+// Tiled 2-D transpose through local memory: `in` is a contiguous [R, C] matrix, `out` becomes the
+// contiguous [C, R] transpose. 32x32 tiles, 32x8 work-group; the +1 pad avoids bank conflicts, and both
+// the read and the write are coalesced.
+#define TP 32
+__kernel __attribute__((reqd_work_group_size(32, 8, 1)))
+void transpose2d(__global const float* in, __global float* out, ulong R, ulong C) {
+    __local float tile[TP][TP + 1];
+    const uint lx = get_local_id(0), ly = get_local_id(1);
+    const ulong cx = (ulong)get_group_id(0) * TP + lx;   // source column
+    const ulong ry = (ulong)get_group_id(1) * TP + ly;   // source row (first of 4)
+    for (uint j = 0; j < TP; j += 8)
+        if (cx < C && ry + j < R) tile[ly + j][lx] = in[(ry + j) * C + cx];
+    barrier(CLK_LOCAL_MEM_FENCE);
+    const ulong ox = (ulong)get_group_id(1) * TP + lx;   // output column = source row
+    const ulong oy = (ulong)get_group_id(0) * TP + ly;   // output row = source column (first of 4)
+    for (uint j = 0; j < TP; j += 8)
+        if (ox < R && oy + j < C) out[(oy + j) * R + ox] = tile[lx][ly + j];
+}
+
 // y = a + alpha * b (fused update; y may alias a, so no restrict).
 __kernel void axpy(__global const float* a, __global const float* b, __global float* y, ulong n, float alpha) {
     for (ulong i = get_global_id(0); i < n; i += get_global_size(0)) y[i] = a[i] + alpha * b[i];
@@ -116,7 +135,11 @@ __kernel void rand_normal(__global float* y, ulong n, ulong seed) {
 #define TN 4
 
 __kernel __attribute__((reqd_work_group_size(16, 16, 1)))
-void matmul(__global const float* A, __global const float* B, __global float* C, ulong M, ulong N, ulong K) {
+void matmul(__global const float* A, __global const float* B, __global float* C, ulong M, ulong N, ulong K,
+            ulong roff) {
+    // `roff`: first output row to compute (A and C are advanced to it; M is then the number of rows).
+    A += roff * K;
+    C += roff * N;
     __local float As[BK][BM + 1];  // As[k][m]
     __local float Bs[BK][BN];      // Bs[k][n]
     const uint tx = get_local_id(0), ty = get_local_id(1);
@@ -167,7 +190,8 @@ void matmul(__global const float* A, __global const float* B, __global float* C,
 }
 
 // ---- matmul fast path: sub-group tiles, no local memory ---------------------------------------
-// Needs M % 16 == 0, N % 32 == 0, K % 16 == 0 (the host checks) and cl_intel_subgroups. A 16-lane
+// Needs N % 32 == 0, K % 16 == 0 and a whole number of 16-row blocks (the host checks; a leftover of
+// fewer than 16 rows goes to the general kernel above) and cl_intel_subgroups. A 16-lane
 // sub-group computes a 16 x 32 tile of C: lane j owns columns j and j+16 of every tile row. B rows are
 // fetched with one wide block read (lane j gets B[k][j] and B[k][j+16]); A[r][k0+lane] is loaded
 // coalesced and each element is broadcast to all lanes by sub_group_broadcast. About 2x the tiled
@@ -222,7 +246,13 @@ void sum_rows(__global const float* x, __global float* out, ulong outer, ulong n
         ulong hi = min(n, lo + chunk);
         __global const float* p = x + o * n;
         float acc = 0.0f;
-        for (ulong j = lo + lid; j < hi; j += 256) acc += p[j];
+        // 4-wide loads (vload4 needs only element alignment), then a scalar tail.
+        const ulong cnt = hi - lo, n4 = cnt / 4;
+        for (ulong j = lid; j < n4; j += 256) {
+            const float4 v = vload4(j, p + lo);
+            acc += (v.x + v.y) + (v.z + v.w);
+        }
+        for (ulong t = n4 * 4 + lid; t < cnt; t += 256) acc += p[lo + t];
         sh[lid] = acc;
         barrier(CLK_LOCAL_MEM_FENCE);
         for (uint st = 128; st > 0; st >>= 1) {

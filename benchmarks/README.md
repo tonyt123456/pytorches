@@ -34,11 +34,11 @@ true fp32. Median of repeated runs after a time-based warm-up. The last column i
 | | add, 64M floats | 269-341 GB/s | 337 GB/s | 0.8-1.01x (see pitfall 4) |
 | | sum, 64M floats | 259-319 GB/s | 269-274 GB/s | 0.95-1.19x (see pitfall 4) |
 | | MLP train step (4×2048, batch 256) | 261-267 steps/s | 283 steps/s | 0.91-0.94x |
-| **xpu** (Arc) | matmul 2048² | 2,158 GFLOP/s | 4,171 GFLOP/s | 0.52x |
-| | matmul 4096² | 2,028 GFLOP/s | 4,057 GFLOP/s | 0.50x |
-| | add, 64M floats | 80 GB/s | 86 GB/s | 0.93x |
-| | sum, 64M floats | 63 GB/s | 82 GB/s | 0.77x |
-| | MLP train step | 70 steps/s | 116 steps/s | 0.60x |
+| **xpu** (Arc) | matmul 2048² | 2,456-2,479 GFLOP/s | 4,121-4,325 GFLOP/s | 0.57-0.60x |
+| | matmul 4096² | 2,133-2,330 GFLOP/s | 4,418-4,464 GFLOP/s | 0.48-0.52x |
+| | add, 64M floats | 59-87 GB/s | 86-91 GB/s | 0.67-0.96x (see pitfall 4) |
+| | sum, 64M floats | 82-87 GB/s | 86-87 GB/s | 0.95-1.01x |
+| | MLP train step | 96-98 steps/s | 119-132 steps/s | 0.74-0.80x |
 | **cpu** | matmul 1024² | 22 GFLOP/s | 611 GFLOP/s | 0.04x |
 | | add, 8M floats | 8.5 GB/s | 64 GB/s | 0.13x |
 | | sum, 8M floats | 1.8 GB/s | 88 GB/s | 0.02x |
@@ -59,20 +59,29 @@ true fp32. Median of repeated runs after a time-based warm-up. The last column i
   that don't need one (the first layer's data), and the SGD update is one fused `AXPY` pass per tensor
   instead of a multiply, a subtract and a copy. Profile of one step before/after: forward 1.2 ms,
   backward 2.95 -> 2.1 ms, optimizer 1.26 -> 0.45 ms. The remaining gap is per-op launch overhead.
-- **Arc: elementwise ops are at parity, matmul is at ~0.5x, and a training step is at 0.60x** (it started
-  the day at 0.19x, 0.23x and 0.26x). Three changes did it:
-  - A caching allocator (every `a + b` used to create and commit a fresh 256 MB buffer): `add` 17 -> 80 GB/s.
-  - A sub-group matmul kernel for tile-friendly shapes (M % 16, N % 32, K % 16): 1.1 -> 2.2 TFLOP/s, about 2x.
-    Other shapes use the older general kernel.
-  - A fused `AXPY` optimizer update: the SGD step 4.2 -> 1.9 ms.
+- **Arc: elementwise ops and `sum` are at parity, matmul is at ~0.5-0.6x, and a training step is at
+  0.74-0.80x** (it started the day at 0.19x, 0.23x and 0.26x for add, matmul and the step). What did it:
+  - A caching allocator (every `a + b` used to create and commit a fresh 256 MB buffer): `add` 17 -> 80+ GB/s.
+  - A sub-group matmul kernel (N % 32, K % 16; whole 16-row blocks, the leftover rows use the general
+    kernel): 1.1 -> 2.3-2.5 TFLOP/s, about 2x. Other shapes use the older general kernel.
+  - A fused `AXPY` optimizer update: the SGD step 4.2 -> 1.8 ms.
+  - A tiled local-memory transpose for `COPY`s that are 2-D transposes (what backward produces):
+    42 -> 61-64 GB/s.
+  - 4-wide loads in the row `sum`: 68 -> 82-87 GB/s.
 - **The Arc matmul gap is vector-unit efficiency, not matrix engines.** fp32 matmul in PyTorch runs on the
   ordinary vector units here: a pure-FMA kernel measures a **4.1 TFLOP/s** fp32 peak on this Arc 140T
   (128 EUs), and PyTorch reaches 4.0-4.3 of it. Intel's matrix instructions (`DPAS`, advertised through
   `cl_intel_subgroup_matrix_multiply_accumulate`) take fp16/bf16/int8, not fp32, so they matter only for a
-  reduced-precision path. Our kernel is at ~53% of the vector peak. Tried and not better, with spills ruled
-  out as the cause: wider or narrower register tiles, sharing B across a work-group, tile-order swizzles,
-  explicit load prefetch (spills the 128-register file) and the 256-GRF mode (halves occupancy). The next step
-  is likely SLM-staged tiles or a different load pattern, and measuring with a standalone harness first.
+  reduced-precision path. Our kernel is at ~58% of the vector peak. Tried, and none beat ~2.4-2.5 TFLOP/s:
+  wider or narrower register tiles, sharing B across a work-group, tile-order swizzles, register
+  prefetch (spills the 128-register file), hardware `prefetch()`, the 256-GRF mode (halves occupancy) and
+  32-bit index math. Ruled out as the cause by measurement: spills (0 bytes), cache aliasing (non-power-of-two
+  strides behave the same), cache capacity (a cache-resident B is no faster), FMA issue and broadcasts
+  (removing half the FMAs left the time unchanged). That leaves the load path itself; what is still untried
+  is local-memory staging and Intel's 2-D block loads, which this driver does not expose
+  (`cl_intel_subgroup_2d_block_io` is not advertised). A transposed-B kernel (each lane loading its own
+  column's k-values) was correct but 4x slower (0.6 TFLOP/s), so backward still materializes transposes on
+  Arc, now through the faster transpose kernel.
 - **CPU is 10-50x behind**: single-threaded scalar kernels against multi-threaded MKL.
 
 The CPU and Arc gaps are known, simple-to-explain, and the top items on the performance roadmap.

@@ -129,7 +129,7 @@ fn broadcasting_binary() {
 #[test]
 fn transpose_strided_copy() {
     let d = need!();
-    for shape in [[3usize, 5], [64, 33], [1, 9], [100, 1]] {
+    for shape in [[3usize, 5], [64, 33], [1, 9], [100, 1], [32, 32], [31, 33], [33, 31], [65, 64], [2, 3000], [3000, 2], [257, 129]] {
         let (c, x) = both(d, &shape, 7);
         assert_close(&x.t().to_vec(), &c.t().to_vec(), 0.0, "t");
     }
@@ -159,7 +159,12 @@ fn matmul_sizes() {
         (32, 4096, 64),
         (256, 2048, 64),
         (16, 16, 31),
+        // Row counts that are not a multiple of 16: whole blocks on the fast kernel, the rest on the
+        // general one, with the same N and K.
         (17, 16, 32),
+        (31, 64, 64),
+        (100, 128, 96),
+        (1000, 256, 64),
         (16, 17, 32),
         (16, 16, 33),
     ] {

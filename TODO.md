@@ -237,8 +237,9 @@ Ordered by payoff.
 
 - [ ] **CPU plugin: threading + SIMD + blocked matmul.** 10-50x behind MKL (matmul 22 vs 611 GFLOP/s, sum 1.8 vs 88 GB/s). Start with rayon over rows/chunks and a packed, vectorized matmul.
 - [x] **Intel plugin: caching allocator.** `add` on 64M floats 17 -> 80 GB/s (PyTorch 86). Freed buffers are reused by size bucket; the cache is flushed when an allocation fails, and cached bytes count as free in `device_info`.
-- [~] **Intel plugin: matmul.** Sub-group kernel for M % 16, N % 32, K % 16 (about 2x, see benchmarks/README.md). Open: close the rest of the gap to ~4 TFLOP/s on the vector units (SLM tiles, a different load pattern), handle non-tile shapes without the slow kernel, and add a DPAS fp16/bf16 path (needs those dtypes).
-- [ ] Intel plugin: `sum` is 0.77x of PyTorch (63 vs 82 GB/s); `MATMUL_T` is not implemented (core materializes transposes for backward).
+- [~] **Intel plugin: matmul.** Sub-group kernel for N % 32, K % 16 (any M; about 2x, 2.4 vs PyTorch's 4.1-4.4 TFLOP/s; see benchmarks/README.md for what was tried). Open: local-memory staging or 2-D block loads (need a driver that exposes `cl_intel_subgroup_2d_block_io`) for the rest of the gap, a fast path for N or K that are not multiples of 32/16, and a DPAS fp16/bf16 path (needs those dtypes).
+- [x] Intel plugin: `sum` (4-wide loads) at parity; tiled 2-D transpose for COPY (61-64 GB/s, was 42).
+- [ ] Intel plugin: `MATMUL_T` is not implemented (core materializes transposes for backward). A direct transposed-B kernel was 4x slower than the plain kernel plus a copy, so it needs a different design. CUDA's transpose copy (148 GB/s of ~267) could use the same tiled kernel.
 - [x] **CUDA plugin: matmul** now calls cuBLAS (runtime-loaded, built-in kernel as fallback): 1.00x of PyTorch fp32. Still open: tune the fallback kernel (4-5 vs 6.5 TFLOP/s), and an opt-in TF32 / bf16 tensor-core path (PyTorch reaches ~8.5 TFLOP/s with TF32; needs the f16/bf16 dtypes).
 - [x] CUDA `sum` / `add`: vectorized (float4) kernels; at parity. The earlier gap was GPU memory throttling during measurement (benchmarks/README.md, pitfall 4).
 - [x] MLP step on CUDA: 0.54x -> ~0.93x via `MATMUL_T` (no transposed copies), skipping unneeded input gradients, and a fused `AXPY` optimizer update. Remaining ~7%: per-op allocate/launch overhead (no fusion, no CUDA graphs).
