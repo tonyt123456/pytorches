@@ -1,32 +1,119 @@
-//! Reference CPU plugin. Correctness first: no SIMD, no threading.
+//! CPU plugin: multi-threaded and vectorized.
 //!
-//! Exported as a shared library (`pytorches_plugin_cpu.dll`) and also as an rlib so the
-//! core's own tests can register it statically.
+//! * Elementwise ops walk broadcast/strided operands in place, in parallel, with AVX2/FMA inner loops
+//!   (`ew`); `exp`, `log` and `tanh` use vector polynomial versions (`simd`).
+//! * Matmul is a packed, cache-blocked GEMM with a 6x16 AVX2/FMA microkernel and arbitrary operand
+//!   strides, so transposes are free (`gemm`).
+//! * Sums are blocked and combined in a fixed order, so results do not depend on the thread count
+//!   (`reduce`).
+//! * Freed buffers are cached by size and reused, up to a cap, so a hot loop does not page-fault fresh
+//!   memory for every op. Buffer contents are undefined after `alloc`.
+//!
+//! `PYTORCHES_CPU_THREADS` sets the number of worker threads (default: all logical cores).
+//! Exported as a shared library (`pytorches_plugin_cpu.dll`) and also as an rlib so the core's own
+//! tests can register it statically.
+
+mod ew;
+mod gemm;
+mod pool;
+mod reduce;
+mod simd;
 
 use pytorches_plugin_abi::*;
-use std::alloc::{Layout, alloc_zeroed, dealloc};
-use std::borrow::Cow;
+use std::alloc::{Layout, alloc, dealloc};
+use std::collections::HashMap;
 use std::ffi::{c_char, c_void};
 use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::slice;
+use std::sync::Mutex;
+use std::sync::atomic::{AtomicUsize, Ordering};
 
 const HEADER: usize = 64; // also the allocation alignment
 const ERR: &[u8] = b"cpu plugin: operation failed\0";
 
 // ---- memory -----------------------------------------------------------------
 
-unsafe extern "C" fn alloc_buf(_device: u32, bytes: usize, out: *mut *mut c_void) -> Status {
-    let total = bytes + HEADER;
-    let Ok(layout) = Layout::from_size_align(total, HEADER) else {
-        return STATUS_INVALID_ARGUMENT;
-    };
+/// Rounds a request up so similar sizes share buffers: powers of two below 1 MiB, 2 MiB steps above.
+fn bucket(bytes: usize) -> usize {
+    const MIB: usize = 1 << 20;
+    if bytes < MIB { bytes.max(64).next_power_of_two() } else { bytes.div_ceil(2 * MIB) * 2 * MIB }
+}
+
+#[derive(Default)]
+struct Cache {
+    /// Free buffers by (bucketed) payload size; pointers are stored as `usize`.
+    free: HashMap<usize, Vec<usize>>,
+}
+
+static CACHE: Mutex<Option<Cache>> = Mutex::new(None);
+static CACHED_BYTES: AtomicUsize = AtomicUsize::new(0);
+
+/// Most memory the cache may hold: an eighth of physical memory, at most 4 GiB.
+fn cache_cap() -> usize {
+    static CAP: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *CAP.get_or_init(|| {
+        let total = host_memory().map(|(t, _)| t as usize).unwrap_or(8 << 30);
+        (total / 8).min(4 << 30)
+    })
+}
+
+fn lock_cache() -> std::sync::MutexGuard<'static, Option<Cache>> {
+    let mut g = CACHE.lock().unwrap_or_else(|p| p.into_inner());
+    g.get_or_insert_with(Cache::default);
+    g
+}
+
+unsafe fn release_block(payload: usize, size: usize) {
     unsafe {
-        let base = alloc_zeroed(layout);
-        if base.is_null() {
-            return STATUS_OUT_OF_MEMORY;
+        let base = (payload as *mut u8).sub(HEADER);
+        dealloc(base, Layout::from_size_align_unchecked(size + HEADER, HEADER));
+    }
+}
+
+fn flush_cache(c: &mut Cache) {
+    for (size, ptrs) in c.free.drain() {
+        for p in ptrs {
+            unsafe { release_block(p, size) };
+            CACHED_BYTES.fetch_sub(size, Ordering::Relaxed);
         }
-        *(base as *mut usize) = total;
-        *out = base.add(HEADER) as *mut c_void;
+    }
+}
+
+unsafe fn fresh_block(size: usize) -> *mut u8 {
+    unsafe {
+        let Ok(layout) = Layout::from_size_align(size + HEADER, HEADER) else { return std::ptr::null_mut() };
+        let base = alloc(layout);
+        if base.is_null() {
+            return base;
+        }
+        *(base as *mut usize) = size;
+        base.add(HEADER)
+    }
+}
+
+unsafe extern "C" fn alloc_buf(_device: u32, bytes: usize, out: *mut *mut c_void) -> Status {
+    let size = bucket(bytes);
+    if size < bytes || size > isize::MAX as usize - HEADER {
+        return STATUS_OUT_OF_MEMORY;
+    }
+    let mut g = lock_cache();
+    let c = g.as_mut().unwrap();
+    unsafe {
+        if let Some(p) = c.free.get_mut(&size).and_then(|v| v.pop()) {
+            CACHED_BYTES.fetch_sub(size, Ordering::Relaxed);
+            *out = p as *mut c_void;
+            return STATUS_OK;
+        }
+        let mut p = fresh_block(size);
+        if p.is_null() {
+            // Give the cache back to the OS and try once more before reporting out-of-memory.
+            flush_cache(c);
+            p = fresh_block(size);
+            if p.is_null() {
+                return STATUS_OUT_OF_MEMORY;
+            }
+        }
+        *out = p as *mut c_void;
     }
     STATUS_OK
 }
@@ -36,9 +123,13 @@ unsafe extern "C" fn free_buf(_device: u32, ptr: *mut c_void) {
         return;
     }
     unsafe {
-        let base = (ptr as *mut u8).sub(HEADER);
-        let total = *(base as *const usize);
-        dealloc(base, Layout::from_size_align_unchecked(total, HEADER));
+        let size = *((ptr as *mut u8).sub(HEADER) as *const usize);
+        if CACHED_BYTES.load(Ordering::Relaxed) + size > cache_cap() {
+            return release_block(ptr as usize, size);
+        }
+        let mut g = lock_cache();
+        g.as_mut().unwrap().free.entry(size).or_default().push(ptr as usize);
+        CACHED_BYTES.fetch_add(size, Ordering::Relaxed);
     }
 }
 
@@ -114,12 +205,9 @@ unsafe extern "C" fn device_info(device: u32, out: *mut DeviceInfo) -> Status {
         return STATUS_INVALID_ARGUMENT;
     }
     let (total, free) = host_memory().unwrap_or((MEMORY_UNKNOWN, MEMORY_UNKNOWN));
-    let mut info = DeviceInfo {
-        name: [0; 64],
-        kind: KIND_CPU,
-        total_memory: total,
-        free_memory: free,
-    };
+    // Cached buffers are reusable, so they count as free.
+    let free = if free == MEMORY_UNKNOWN { free } else { free.saturating_add(CACHED_BYTES.load(Ordering::Relaxed) as u64).min(total) };
+    let mut info = DeviceInfo { name: [0; 64], kind: KIND_CPU, total_memory: total, free_memory: free };
     for (dst, &b) in info.name.iter_mut().zip(b"cpu") {
         *dst = b as c_char;
     }
@@ -141,16 +229,17 @@ unsafe extern "C" fn supports_op(code: u32) -> u32 {
     use op::*;
     matches!(
         code,
-        NEG | EXP | LOG | RELU | TANH | STEP | ADD | SUB | MUL | DIV | MATMUL | SUM_AXIS | COPY | FILL | RAND_NORMAL
+        NEG | EXP | LOG | RELU | TANH | STEP | ADD | SUB | MUL | DIV | MATMUL | MATMUL_T | AXPY | SUM_AXIS | COPY | FILL | RAND_NORMAL
     ) as u32
 }
 
 unsafe fn dims<'a>(d: &TensorDesc) -> (&'a [u64], &'a [u64]) {
     unsafe {
-        (
-            slice::from_raw_parts(d.shape, d.ndim as usize),
-            slice::from_raw_parts(d.strides, d.ndim as usize),
-        )
+        if d.ndim == 0 {
+            (&[], &[])
+        } else {
+            (slice::from_raw_parts(d.shape, d.ndim as usize), slice::from_raw_parts(d.strides, d.ndim as usize))
+        }
     }
 }
 
@@ -158,145 +247,85 @@ fn numel(shape: &[u64]) -> usize {
     shape.iter().product::<u64>() as usize
 }
 
-fn is_contiguous(shape: &[u64], strides: &[u64]) -> bool {
-    let mut expect = 1u64;
-    for i in (0..shape.len()).rev() {
-        if shape[i] != 1 && strides[i] != expect {
-            return false;
-        }
-        expect *= shape[i];
-    }
-    true
-}
-
-/// Reads a tensor argument as a contiguous slice, gathering through its strides if needed.
-unsafe fn read<'a>(d: &TensorDesc) -> Cow<'a, [f32]> {
-    unsafe {
-        let (shape, strides) = dims(d);
-        let n = numel(shape);
-        let ptr = d.data as *const f32;
-        if is_contiguous(shape, strides) {
-            return Cow::Borrowed(slice::from_raw_parts(ptr, n));
-        }
-        let mut out = Vec::with_capacity(n);
-        let mut idx = vec![0u64; shape.len()];
-        let mut off = 0usize;
-        for _ in 0..n {
-            out.push(*ptr.add(off));
-            for dim in (0..shape.len()).rev() {
-                idx[dim] += 1;
-                off += strides[dim] as usize;
-                if idx[dim] < shape[dim] {
-                    break;
-                }
-                off -= (strides[dim] * shape[dim]) as usize;
-                idx[dim] = 0;
-            }
-        }
-        Cow::Owned(out)
-    }
-}
-
-unsafe fn write<'a>(d: &TensorDesc) -> &'a mut [f32] {
-    unsafe {
-        let (shape, _) = dims(d);
-        slice::from_raw_parts_mut(d.data as *mut f32, numel(shape))
-    }
-}
-
-fn splitmix64(mut x: u64) -> u64 {
-    x = x.wrapping_add(0x9E37_79B9_7F4A_7C15);
-    x = (x ^ (x >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
-    x = (x ^ (x >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
-    x ^ (x >> 31)
-}
-
-/// Counter-based N(0,1); the exact recipe is specified in `pytorches_plugin_abi::op::RAND_NORMAL`.
-fn rand_normal(seed: u64, i: u64) -> f32 {
-    let h = splitmix64(seed ^ i.wrapping_mul(0x9E37_79B9_7F4A_7C15));
-    let u1 = ((h >> 40) + 1) as f32 / 16777216.0;
-    let u2 = (h & 0xFF_FFFF) as f32 / 16777216.0;
-    (-2.0 * u1.ln()).sqrt() * (2.0 * std::f32::consts::PI * u2).cos()
-}
-
 unsafe fn run(op_code: u32, attrs: &OpAttrs, ins: &[TensorDesc], outs: &[TensorDesc]) -> Status {
     use op::*;
     if outs.len() != 1 {
         return STATUS_INVALID_ARGUMENT;
     }
+    let need = match op_code {
+        FILL | RAND_NORMAL => 0,
+        NEG | EXP | LOG | RELU | TANH | STEP | COPY | SUM_AXIS => 1,
+        ADD | SUB | MUL | DIV | MATMUL | MATMUL_T | AXPY => 2,
+        _ => return STATUS_UNSUPPORTED,
+    };
+    if ins.len() != need {
+        return STATUS_INVALID_ARGUMENT;
+    }
     unsafe {
-        let out = write(&outs[0]);
+        let (oshape, _) = dims(&outs[0]);
+        let n = numel(oshape);
+        let out = outs[0].data as *mut f32;
         match op_code {
-            FILL => out.fill(f32::from_bits(attrs.ints[0] as u32)),
-            RAND_NORMAL => {
-                let seed = attrs.ints[0] as u64;
-                for (i, o) in out.iter_mut().enumerate() {
-                    *o = rand_normal(seed, i as u64);
-                }
-            }
+            FILL => ew::fill(out, n, f32::from_bits(attrs.ints[0] as u32)),
+            RAND_NORMAL => ew::randn(out, n, attrs.ints[0] as u64),
             NEG | EXP | LOG | RELU | TANH | STEP | COPY => {
-                let x = read(&ins[0]);
-                let f: fn(f32) -> f32 = match op_code {
-                    NEG => |v| -v,
-                    EXP => f32::exp,
-                    LOG => f32::ln,
-                    RELU => |v| v.max(0.0),
-                    TANH => f32::tanh,
-                    STEP => |v| if v > 0.0 { 1.0 } else { 0.0 },
-                    _ => |v| v, // COPY
-                };
-                for (o, &v) in out.iter_mut().zip(x.iter()) {
-                    *o = f(v);
+                let (xs, xst) = dims(&ins[0]);
+                if numel(xs) != n {
+                    return STATUS_INVALID_ARGUMENT;
                 }
+                ew::unary(op_code, ins[0].data as *const f32, xs, xst, out);
             }
             ADD | SUB | MUL | DIV => {
-                let (a, b) = (read(&ins[0]), read(&ins[1]));
-                let f: fn(f32, f32) -> f32 = match op_code {
-                    ADD => |x, y| x + y,
-                    SUB => |x, y| x - y,
-                    MUL => |x, y| x * y,
-                    _ => |x, y| x / y,
-                };
-                for ((o, &x), &y) in out.iter_mut().zip(a.iter()).zip(b.iter()) {
-                    *o = f(x, y);
+                let ((sa, sta), (sb, stb)) = (dims(&ins[0]), dims(&ins[1]));
+                if sa != oshape || sb != oshape {
+                    return STATUS_INVALID_ARGUMENT;
                 }
+                ew::binary(op_code, ins[0].data as *const f32, sta, ins[1].data as *const f32, stb, oshape, out);
             }
-            MATMUL => {
-                let (sa, _) = dims(&ins[0]);
-                let (sb, _) = dims(&ins[1]);
-                let (m, k, n) = (sa[0] as usize, sa[1] as usize, sb[1] as usize);
-                let (a, b) = (read(&ins[0]), read(&ins[1]));
-                out.fill(0.0);
-                for i in 0..m {
-                    for p in 0..k {
-                        let av = a[i * k + p];
-                        let (brow, orow) = (&b[p * n..(p + 1) * n], &mut out[i * n..(i + 1) * n]);
-                        for j in 0..n {
-                            orow[j] += av * brow[j];
-                        }
-                    }
+            AXPY => {
+                if numel(dims(&ins[0]).0) != n || numel(dims(&ins[1]).0) != n {
+                    return STATUS_INVALID_ARGUMENT;
                 }
+                ew::axpy(ins[0].data as *const f32, ins[1].data as *const f32, out, f32::from_bits(attrs.ints[0] as u32), n);
+            }
+            MATMUL | MATMUL_T => {
+                let ((sa, sta), (sb, stb)) = (dims(&ins[0]), dims(&ins[1]));
+                if sa.len() != 2 || sb.len() != 2 || oshape.len() != 2 {
+                    return STATUS_INVALID_ARGUMENT;
+                }
+                let flags = if op_code == MATMUL_T { attrs.ints[0] } else { 0 };
+                let (ta, tb) = (flags & 1 != 0, flags & 2 != 0);
+                // Logical A is [m,k], B is [k,n]; a flagged operand is the transpose of what is stored.
+                let (m, k) = if ta { (sa[1], sa[0]) } else { (sa[0], sa[1]) };
+                let (kb, nn) = if tb { (sb[1], sb[0]) } else { (sb[0], sb[1]) };
+                if k != kb || oshape[0] != m || oshape[1] != nn {
+                    return STATUS_INVALID_ARGUMENT;
+                }
+                let a = if ta {
+                    gemm::Mat { ptr: ins[0].data as *const f32, rs: sta[1] as usize, cs: sta[0] as usize }
+                } else {
+                    gemm::Mat { ptr: ins[0].data as *const f32, rs: sta[0] as usize, cs: sta[1] as usize }
+                };
+                let b = if tb {
+                    gemm::Mat { ptr: ins[1].data as *const f32, rs: stb[1] as usize, cs: stb[0] as usize }
+                } else {
+                    gemm::Mat { ptr: ins[1].data as *const f32, rs: stb[0] as usize, cs: stb[1] as usize }
+                };
+                gemm::sgemm(m as usize, nn as usize, k as usize, a, b, out);
             }
             SUM_AXIS => {
                 let (shape, _) = dims(&ins[0]);
                 let axis = attrs.ints[0] as usize;
-                if axis >= shape.len() {
+                if attrs.ints[0] < 0 || axis >= shape.len() {
                     return STATUS_INVALID_ARGUMENT;
                 }
-                let x = read(&ins[0]);
                 let outer = numel(&shape[..axis]);
-                let n = shape[axis] as usize;
+                let len = shape[axis] as usize;
                 let inner = numel(&shape[axis + 1..]);
-                out.fill(0.0);
-                for o in 0..outer {
-                    for j in 0..n {
-                        let src = &x[(o * n + j) * inner..(o * n + j + 1) * inner];
-                        let dst = &mut out[o * inner..(o + 1) * inner];
-                        for i in 0..inner {
-                            dst[i] += src[i];
-                        }
-                    }
+                if outer * inner != n {
+                    return STATUS_INVALID_ARGUMENT;
                 }
+                reduce::sum_axis(ins[0].data as *const f32, outer, len, inner, out);
             }
             _ => return STATUS_UNSUPPORTED,
         }
@@ -316,8 +345,8 @@ unsafe extern "C" fn execute(
     // Never unwind across the C boundary.
     catch_unwind(AssertUnwindSafe(|| unsafe {
         let attrs = if attrs.is_null() { OpAttrs::default() } else { *attrs };
-        let ins = slice::from_raw_parts(inputs, n_inputs as usize);
-        let outs = slice::from_raw_parts(outputs, n_outputs as usize);
+        let ins: &[TensorDesc] = if n_inputs == 0 { &[] } else { slice::from_raw_parts(inputs, n_inputs as usize) };
+        let outs: &[TensorDesc] = if n_outputs == 0 { &[] } else { slice::from_raw_parts(outputs, n_outputs as usize) };
         run(op_code, &attrs, ins, outs)
     }))
     .unwrap_or(STATUS_INTERNAL)

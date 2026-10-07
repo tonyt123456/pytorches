@@ -133,7 +133,7 @@ Fix the cracks now, while there is one backend. These get more expensive with ev
 - [ ] Op fusion: elementwise chains into one kernel
 - [ ] Shared kernel IR/codegen: one op description lowered to PTX (CUDA), SPIR-V (Arc), AMDGPU (ROCm), instead of hand-writing each kernel per plugin
 - [ ] Tuned matmul, attention (FlashAttention-style), softmax, layernorm, conv kernels
-- [ ] CPU plugin: SIMD (AVX2/AVX-512/NEON), threading (rayon), blocked matmul
+- [x] CPU plugin: AVX2/FMA SIMD, threads (custom spin-then-park pool), packed blocked matmul, vector exp/log/tanh, caching allocator. Open: AVX-512 and NEON paths, and a per-ISA microkernel selection (see the performance section)
 - [ ] Memory planner for training (activation lifetimes, optional recompute/checkpointing)
 - [ ] Continuous benchmark tracking in CI (regression alerts)
 
@@ -200,7 +200,6 @@ Fix the cracks now, while there is one backend. These get more expensive with ev
 - Only `f32`, contiguous tensors; transposes and broadcasts are materialized.
 - Plugin discovery depends on env var / CWD, not install location.
 - Windows-only build script; no CI yet.
-- CPU plugin is naive (single-threaded, no SIMD).
 
 ---
 
@@ -235,7 +234,10 @@ Found while building and testing the CUDA and Intel Arc plugins and the demo.
 
 Ordered by payoff.
 
-- [ ] **CPU plugin: threading + SIMD + blocked matmul.** 10-50x behind MKL (matmul 22 vs 611 GFLOP/s, sum 1.8 vs 88 GB/s). Start with rayon over rows/chunks and a packed, vectorized matmul.
+- [x] **CPU plugin: threading + SIMD + blocked matmul.** Was 10-50x behind MKL; now at parity or better on matmul 512-1024 (1.0-1.7x), add, sum (see benchmarks/README.md). x86-64 AVX2/FMA only.
+- [ ] CPU: AVX-512 microkernel (this laptop has none) and an aarch64/NEON path; both are selected at run time in `plugins/cpu/src/gemm.rs` / `ew.rs`, with the scalar fallback already in place. The scalar path is correct but untuned.
+- [ ] CPU: matmuls of 128-384 still pay dispatch cost; try fewer threads for small problems, and a per-core-type (P vs E core) task split on hybrid CPUs. Under heavy background load the spinning pool is less robust than MKL.
+- [ ] CPU: choose the default thread count from the topology (physical/performance cores) instead of all logical cores; today `PYTORCHES_CPU_THREADS` is the only knob.
 - [x] **Intel plugin: caching allocator.** `add` on 64M floats 17 -> 80 GB/s (PyTorch 86). Freed buffers are reused by size bucket; the cache is flushed when an allocation fails, and cached bytes count as free in `device_info`.
 - [~] **Intel plugin: matmul.** Sub-group kernel for N % 32, K % 16 (any M; about 2x, 2.4 vs PyTorch's 4.1-4.4 TFLOP/s; see benchmarks/README.md for what was tried). Open: local-memory staging or 2-D block loads (need a driver that exposes `cl_intel_subgroup_2d_block_io`) for the rest of the gap, a fast path for N or K that are not multiples of 32/16, and a DPAS fp16/bf16 path (needs those dtypes).
 - [x] Intel plugin: `sum` (4-wide loads) at parity; tiled 2-D transpose for COPY (61-64 GB/s, was 42).
@@ -243,6 +245,6 @@ Ordered by payoff.
 - [x] **CUDA plugin: matmul** now calls cuBLAS (runtime-loaded, built-in kernel as fallback): 1.00x of PyTorch fp32. Still open: tune the fallback kernel (4-5 vs 6.5 TFLOP/s), and an opt-in TF32 / bf16 tensor-core path (PyTorch reaches ~8.5 TFLOP/s with TF32; needs the f16/bf16 dtypes).
 - [x] CUDA `sum` / `add`: vectorized (float4) kernels; at parity. The earlier gap was GPU memory throttling during measurement (benchmarks/README.md, pitfall 4).
 - [x] MLP step on CUDA: 0.54x -> ~0.93x via `MATMUL_T` (no transposed copies), skipping unneeded input gradients, and a fused `AXPY` optimizer update. Remaining ~7%: per-op allocate/launch overhead (no fusion, no CUDA graphs).
-- [ ] Optional ABI ops `MATMUL_T` and `AXPY`: CUDA has both, Arc has `AXPY`, the CPU plugin has neither (core falls back to the old path). Add `MATMUL_T` to Arc and both to CPU.
+- [ ] Optional ABI ops `MATMUL_T` and `AXPY`: CUDA and CPU have both, Arc has `AXPY`. Add `MATMUL_T` to Arc (a direct transposed-B kernel was 4x slower; see benchmarks/README.md).
 - [x] `calibrate()` bounds its queued work (syncs every 4 matmuls). It used to enqueue for a fixed amount of host time, which was harmless while Arc allocation was slow but queued minutes of GPU work once allocation was cached. The differential suite went from ~20 s to ~2.4 s.
 - [ ] Benchmarks: add a regression guard (track numbers per commit), and extend workloads (attention-shaped matmuls, softmax, layernorm) once those ops exist.

@@ -39,10 +39,11 @@ true fp32. Median of repeated runs after a time-based warm-up. The last column i
 | | add, 64M floats | 59-87 GB/s | 86-91 GB/s | 0.67-0.96x (see pitfall 4) |
 | | sum, 64M floats | 82-87 GB/s | 86-87 GB/s | 0.95-1.01x |
 | | MLP train step | 96-98 steps/s | 119-132 steps/s | 0.74-0.80x |
-| **cpu** | matmul 1024² | 22 GFLOP/s | 611 GFLOP/s | 0.04x |
-| | add, 8M floats | 8.5 GB/s | 64 GB/s | 0.13x |
-| | sum, 8M floats | 1.8 GB/s | 88 GB/s | 0.02x |
-| | MLP train step (4×512, batch 64) | 49 steps/s | 443 steps/s | 0.11x |
+| **cpu** (16 threads) | matmul 512² | 541-805 GFLOP/s | 468-874 GFLOP/s | 0.92-1.72x |
+| | matmul 1024² | 693-763 GFLOP/s | 579-637 GFLOP/s | 1.16-1.22x |
+| | add, 8M floats | 67-78 GB/s | 64-72 GB/s | 1.01-1.17x |
+| | sum, 8M floats | 96-211 GB/s | 82-111 GB/s | 1.15-1.91x |
+| | MLP train step (4×512, batch 64) | 544-1,218 steps/s | 706-960 steps/s | 0.57-1.66x |
 
 (Workload sizes are smaller on CPU, identical for both libraries on the same device.)
 
@@ -82,7 +83,26 @@ true fp32. Median of repeated runs after a time-based warm-up. The last column i
   (`cl_intel_subgroup_2d_block_io` is not advertised). A transposed-B kernel (each lane loading its own
   column's k-values) was correct but 4x slower (0.6 TFLOP/s), so backward still materializes transposes on
   Arc, now through the faster transpose kernel.
-- **CPU is 10-50x behind**: single-threaded scalar kernels against multi-threaded MKL.
+- **CPU is at parity with MKL** (it started 10-50x behind: single-threaded scalar kernels, a fresh
+  allocation per op). What changed, in the order it paid off:
+  - Threads plus AVX2/FMA inner loops for elementwise ops, in place for broadcasts (the old code copied
+    every strided operand first), and vector `exp`/`log`/`tanh` (libm has no vector form, so these were
+    scalar calls): `add` 8.5 -> 67-78 GB/s, `sum` 1.8 -> 96-211 GB/s.
+  - A packed, cache-blocked GEMM with a 6x16 AVX2/FMA microkernel: 24 -> 693-763 GFLOP/s at 1024².
+    Packing reads arbitrary strides, so transposed operands (`MATMUL_T`) cost nothing, and `AXPY`
+    fuses the optimizer update.
+  - A caching allocator (capped at an eighth of RAM) and a custom thread pool that spins briefly before
+    sleeping. Dispatching to a sleeping rayon worker costs 53-119 us on Windows, longer than a small
+    matmul; with a 100 us spin it costs 2-10 us. The MLP step went 53 -> ~1,000+ steps/s.
+  - The spin window is a real trade-off, measured: none loses the small-op speed (MLP step 520-700 vs
+    1,060-1,180 steps/s), and 300 us or more makes large ops slower (matmul 1024: ~720 -> 380-520
+    GFLOP/s, add 78 -> 46 GB/s), likely because workers parked in a spin loop get moved to slow cores
+    on this hybrid CPU. `PYTORCHES_CPU_SPIN_US` and `PYTORCHES_CPU_THREADS` expose both knobs.
+  - Results do not depend on the thread count: work is cut into fixed chunks and partial sums are
+    combined in a fixed order, so runs are bit-identical.
+  - Where it is still behind: matmuls of 128-384 (a fraction of a millisecond) still pay some dispatch
+    cost; and under heavy background load a spinning pool is more fragile than MKL (a worker descheduled
+    mid-task stalls the job until it runs again).
 
 The CPU and Arc gaps are known, simple-to-explain, and the top items on the performance roadmap.
 The point of PyTorches' architecture is that each of them is fixable inside one plugin.
@@ -112,3 +132,9 @@ Written down because they produced a wrong headline once:
    throttled, against 4 of 5 without it), so the Arc's load is not the explanation by itself, though the
    power budget is shared across the laptop and that was not ruled out. The desktop (`dwm`, etc.) keeps the
    Intel GPU at ~15-25% regardless, and our CUDA benchmark does not touch it.
+5. **A busy desktop moves CPU numbers a lot, and moves them for PyTorch too.** While this was measured,
+   Task Manager, Slack, Zoom and a browser kept the machine at 20-45% CPU even when idle; MKL's matmul
+   readings ranged 19-874 GFLOP/s across runs (19 at 2048², in one run), and ours showed the same kind of
+   swing. Fork-join libraries stall when a worker is descheduled mid-task. Compare medians of repeated
+   runs, close other applications for a number you intend to keep, and treat the ranges in the table as
+   the result rather than any single run.

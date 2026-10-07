@@ -190,18 +190,18 @@ plugins:
   loaded   xpu    (pytorches_plugin_xpu.dll)
 
 devices:
-  cpu:0    cpu                                      51.4 GiB free / 63.4 GiB  31.2 GFLOP/s
-  cuda:0   NVIDIA RTX PRO 1000 Blackwell ...         6.9 GiB free / 8.0 GiB    2.87 TFLOP/s
-  xpu:0    Intel(R) Arc(TM) 140T GPU (32GB)         33.5 GiB free / 33.5 GiB  964.9 GFLOP/s
+  cpu:0    cpu                                      40.6 GiB free / 63.4 GiB  285.4 GFLOP/s
+  cuda:0   NVIDIA RTX PRO 1000 Blackwell ...         6.8 GiB free / 8.0 GiB    6.56 TFLOP/s
+  xpu:0    Intel(R) Arc(TM) 140T GPU (32GB)         33.5 GiB free / 33.5 GiB  2.36 TFLOP/s
 ```
 
 **2. The same script on every device** (a 4-layer, 2048-wide MLP, batch 256, one training step):
 
 | device | time per step |
 |---|---|
-| `cpu:0` (naive reference kernels) | 1,930 ms |
-| `xpu:0` (Intel Arc 140T) | 38 ms |
-| `cuda:0` (RTX PRO 1000) | 9.5 ms |
+| `cpu:0` (Core Ultra 7 265H, 16 threads) | 33.7 ms |
+| `xpu:0` (Intel Arc 140T) | 10.7 ms |
+| `cuda:0` (RTX PRO 1000) | 3.6 ms |
 
 **3. Placement.** A model that fits the fast GPU goes there. One that doesn't goes to the
 big-memory device, and the planner says why:
@@ -210,14 +210,14 @@ big-memory device, and the planner says why:
 Placement plan: workload needs ~6.5 GiB
 
   device   name                               free / total         speed          fits
-  cuda:0   NVIDIA RTX PRO 1000 Blackwell Gene 6.9 GiB / 8.0 GiB    2.87 TFLOP/s   no
-  xpu:0    Intel(R) Arc(TM) 140T GPU (32GB)   33.5 GiB / 33.5 GiB  964.9 GFLOP/s  yes  <- chosen
-  cpu:0    cpu                                50.1 GiB / 63.4 GiB  31.2 GFLOP/s   yes
+  cuda:0   NVIDIA RTX PRO 1000 Blackwell Gene 6.8 GiB / 8.0 GiB    6.56 TFLOP/s   no
+  xpu:0    Intel(R) Arc(TM) 140T GPU (32GB)   33.5 GiB / 33.5 GiB  2.36 TFLOP/s   yes  <- chosen
+  cpu:0    cpu                                40.0 GiB / 63.4 GiB  285.4 GFLOP/s  yes
 
-  -> xpu:0: needs 6.5 GiB; the fastest device (cuda:0) has only 6.9 GiB free, so fall back to xpu:0
+  -> xpu:0: needs 6.5 GiB; the fastest device (cuda:0) has only 6.8 GiB free, so fall back to xpu:0
 ```
 
-That run then trains an 805M-parameter, 12-layer MLP on the Arc (about 2 s per step), a model that
+That run then trains an 805M-parameter, 12-layer MLP on the Arc (about 0.4 s per step), a model that
 doesn't fit the RTX's free memory. The speed column comes from a short matmul benchmark run through
 each plugin, so it reflects what that plugin can actually do on this machine. See
 [examples/demo.py](examples/demo.py); `--dry-run` prints only the placement decisions.
@@ -228,14 +228,15 @@ Against PyTorch 2.13 on the same laptop (full table and methodology in [benchmar
 
 | | matmul 4096² | elementwise add | MLP train step |
 |---|---|---|---|
-| **CUDA** (RTX PRO 1000) | 0.71x | **1.01x** | 0.54x |
-| **Intel Arc** | 0.26x | 0.19x | 0.26x |
-| **CPU** | 0.04x | 0.13x | 0.11x |
+| **CUDA** (RTX PRO 1000) | **1.01x** | **1.01x** | 0.93x |
+| **Intel Arc** | 0.50-0.52x | 0.67-0.96x | 0.74-0.80x |
+| **CPU** (matmul 1024², add 8M) | 1.16-1.22x | 1.01-1.17x | 0.57-1.66x |
 
-(`PyTorch time / PyTorches time`: above 1.00x we're faster.) PyTorches is slower almost everywhere: it
-matches PyTorch on memory-bound CUDA ops and trails on compute-bound ones, because the kernels are simple
-and untuned. The CPU plugin is single-threaded and the Arc plugin has no caching allocator yet. None of that
-is architectural: each gap is closed inside one plugin, which is the point of the design.
+(`PyTorch time / PyTorches time`: above 1.00x we're faster. Ranges are repeated runs on a busy laptop;
+the benchmarks README explains why they move.) PyTorches is within noise of PyTorch on CUDA and CPU
+throughput, and on Arc matmul it reaches about half of PyTorch's speed. Each gap was closed inside one
+plugin, which is the point of the design. The machine is shared: an unusually busy desktop moves every
+number here, PyTorch's included.
 
 ## Correctness first
 
