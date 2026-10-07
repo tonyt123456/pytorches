@@ -4,9 +4,25 @@ build-backend = "maturin"
 
 [project]
 name = "pytorches"
+description = "PyTorch-interoperable tensor and autograd engine in Rust with automatic, plugin-based hardware backends"
+readme = "../../README.md"
 requires-python = ">=3.11"
+license = { text = "Apache-2.0" }
 dynamic = ["version"]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "License :: OSI Approved :: Apache Software License",
+    "Programming Language :: Rust",
+    "Programming Language :: Python :: 3",
+    "Topic :: Scientific/Engineering :: Artificial Intelligence",
+]
+
+[project.urls]
+Repository = "https://github.com/tonyt123456/pytorches"
 
 [tool.maturin]
 python-source = "python"
 module-name = "pytorches._native"
+# Device plugins are staged into python/pytorches/plugins by scripts/stage-plugins.sh
+# (gitignored, so list them explicitly). pytorches/__init__.py finds them there.
+include = [{ path = "python/pytorches/plugins/*", format = "wheel" }]

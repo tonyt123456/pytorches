@@ -6,3 +6,5 @@ __pycache__/
 /plugins/bin/*
 !/plugins/bin/.gitkeep
 *.pdb
+
+/crates/python/python/pytorches/plugins/
