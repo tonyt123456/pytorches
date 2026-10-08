@@ -138,6 +138,20 @@ dependencies = [
 ]
 
 [[package]]
+name = "pytorches-plugin-metal"
+version = "0.1.0"
+dependencies = [
+ "pytorches-plugin-abi",
+]
+
+[[package]]
+name = "pytorches-plugin-rocm"
+version = "0.1.0"
+dependencies = [
+ "pytorches-plugin-abi",
+]
+
+[[package]]
 name = "pytorches-plugin-xpu"
 version = "0.1.0"
 dependencies = [

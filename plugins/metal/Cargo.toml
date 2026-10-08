@@ -1,0 +1,13 @@
+[package]
+name = "pytorches-plugin-metal"
+description = "Apple Metal plugin (placeholder: reports no devices)"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[lib]
+name = "pytorches_plugin_metal"
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+pytorches-plugin-abi = { path = "../../crates/plugin-abi" }

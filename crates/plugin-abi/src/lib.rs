@@ -47,6 +47,7 @@ pub const KIND_CUDA: u32 = 1;
 pub const KIND_ROCM: u32 = 2;
 pub const KIND_XPU: u32 = 3;
 pub const KIND_NPU: u32 = 4;
+pub const KIND_METAL: u32 = 5;
 pub const KIND_OTHER: u32 = 255;
 
 /// Reported by `device_info` when a figure is unavailable.

@@ -276,6 +276,7 @@ ABI evolution: ops are append-only. A layout change bumps `ABI_VERSION`.
 | `plugins/cpu` | Reference backend. |
 | `plugins/cuda` | NVIDIA via the CUDA driver API (`nvcuda.dll`), with committed PTX kernels. Needs only the driver. |
 | `plugins/xpu` | Intel GPUs via the OpenCL runtime in the Intel graphics driver. |
+| `plugins/rocm`, `plugins/metal` | Placeholders for AMD and Apple GPUs. They load but report no devices. |
 | `plugins/bin` | Built plugin libraries; the runtime scans this directory. |
 | `tests/diff` | Differential tests against PyTorch. |
 | `examples/` | The demo. |

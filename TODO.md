@@ -158,9 +158,9 @@ Fix the cracks now, while there is one backend. These get more expensive with ev
 
 ## Phase 8: More backends and distribution
 
-- [ ] ROCm plugin (current ROCm/HIP, gfx942/950, RDNA3/4)
+- [ ] ROCm plugin (current ROCm/HIP, gfx942/950, RDNA3/4) (placeholder crate `plugins/rocm` exists; reports no devices)
 - [ ] Vulkan/SPIR-V fallback plugin for "any GPU"
-- [ ] Apple Metal plugin
+- [ ] Apple Metal plugin (placeholder crate `plugins/metal` exists; reports no devices)
 - [ ] Google TPU via StableHLO/XLA plugin
 - [ ] Intel NPU plugin (inference only, static shapes, OpenVINO / Level Zero NPU)
 - [ ] **Hardware detection** (`pt.doctor()`): report GPUs, drivers, which plugins match
