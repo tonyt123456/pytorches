@@ -7,8 +7,10 @@
 //! Current scope: `f32`, contiguous tensors. Broadcasting and transposes are expressed
 //! as strided operands at dispatch time rather than as stored views.
 
+pub mod graph;
 pub mod plan;
 pub mod plugin;
+pub mod strategy;
 
 use plugin::Plugin;
 use pytorches_plugin_abi::{self as abi, OpAttrs, TensorDesc, op};
@@ -122,6 +124,8 @@ pub struct DeviceInfo {
     pub kind: u32,
     pub total_memory: Option<u64>,
     pub free_memory: Option<u64>,
+    /// Allocates from system RAM, so host free memory also limits it (see `plan`).
+    pub shared_host_memory: bool,
 }
 
 impl Device {
@@ -163,12 +167,18 @@ impl Device {
     }
 
     pub fn info(&self) -> DeviceInfo {
-        let mut raw = abi::DeviceInfo { name: [0; 64], kind: abi::KIND_OTHER, total_memory: 0, free_memory: 0 };
+        let mut raw = abi::DeviceInfo { name: [0; 64], kind: abi::KIND_OTHER, total_memory: 0, free_memory: 0, flags: 0 };
         let status = unsafe { (self.plugin.vt.device_info)(self.index, &mut raw) };
         assert_eq!(status, abi::STATUS_OK, "device_info failed: {}", self.plugin.last_error());
         let name = unsafe { std::ffi::CStr::from_ptr(raw.name.as_ptr()) }.to_string_lossy().into_owned();
         let mem = |v: u64| (v != abi::MEMORY_UNKNOWN).then_some(v);
-        DeviceInfo { name, kind: raw.kind, total_memory: mem(raw.total_memory), free_memory: mem(raw.free_memory) }
+        DeviceInfo {
+            name,
+            kind: raw.kind,
+            total_memory: mem(raw.total_memory),
+            free_memory: mem(raw.free_memory),
+            shared_host_memory: raw.flags & abi::DEVICE_FLAG_SHARED_HOST_MEMORY != 0,
+        }
     }
 
     pub fn synchronize(&self) {

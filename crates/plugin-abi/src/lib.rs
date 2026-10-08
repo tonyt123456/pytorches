@@ -27,7 +27,7 @@
 
 use core::ffi::{c_char, c_void};
 
-pub const ABI_VERSION: u32 = 2;
+pub const ABI_VERSION: u32 = 3;
 /// NUL-terminated name of the exported entry function (`EntryFn`).
 pub const ENTRY_SYMBOL: &[u8] = b"pytorches_plugin_entry\0";
 /// Required file-name prefix for plugin libraries in the plugin directory.
@@ -130,7 +130,14 @@ pub struct DeviceInfo {
     pub kind: u32,
     pub total_memory: u64,
     pub free_memory: u64,
+    /// `DEVICE_FLAG_*` bits.
+    pub flags: u32,
 }
+
+/// The device allocates from system RAM (integrated GPU, Apple silicon). Its `free_memory` is then
+/// only what the plugin itself can see; the real limit is also the host's free memory, and the
+/// device competes with the CPU and every other process for it.
+pub const DEVICE_FLAG_SHARED_HOST_MEMORY: u32 = 1 << 0;
 
 #[repr(C)]
 pub struct PluginVTable {

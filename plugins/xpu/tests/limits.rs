@@ -64,7 +64,7 @@ fn allocation_limits() {
             eprintln!("SKIP: no Intel OpenCL GPU");
             return;
         }
-        let mut info = DeviceInfo { name: [0; 64], kind: 0, total_memory: 0, free_memory: 0 };
+        let mut info = DeviceInfo { name: [0; 64], kind: 0, total_memory: 0, free_memory: 0, flags: 0 };
         assert_eq!((vt.device_info)(0, &mut info), STATUS_OK);
         let name = std::ffi::CStr::from_ptr(info.name.as_ptr()).to_string_lossy().into_owned();
         eprintln!("device '{name}' total={} MiB free={} MiB", info.total_memory >> 20, info.free_memory >> 20);

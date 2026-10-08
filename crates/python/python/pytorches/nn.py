@@ -12,6 +12,11 @@ from . import _native
 _seed = [1000]
 
 
+def manual_seed(seed):
+    """Make layers created after this call initialize identically on every run and placement."""
+    _seed[0] = 1000 + seed
+
+
 def _next_seed():
     _seed[0] += 1
     return _seed[0]
@@ -93,8 +98,39 @@ class Module:
         for name, child in self._children():
             child._load(state, f"{prefix}{name}.")
 
+    # ---- placement -------------------------------------------------------------------------
+
+    def to(self, device):
+        """Move every parameter to `device`, in place on this module. Parameters become new leaf
+        tensors (any `.grad` is dropped), so build the optimizer after moving."""
+        device = _canonical(device)
+        for n in self._local_names():
+            p = getattr(self, n)
+            if p.device != device:
+                setattr(self, n, p.detach().to(device).requires_grad_(True))
+        for _, child in self._children():
+            child.to(device)
+        return self
+
+    def _cost(self, in_shape):
+        """`(out_shape, forward_flops)` for an input of `in_shape`; lets the planner describe this
+        module without running it. Modules that can sit in a placed chain implement this."""
+        raise NotImplementedError(f"{type(self).__name__} cannot describe its cost to the planner")
+
     def __call__(self, *args):
         return self.forward(*args)
+
+
+def _canonical(device):
+    """`"cuda"` -> `"cuda:0"`, matching what `Tensor.device` reports."""
+    return device if ":" in device else f"{device}:0"
+
+
+def _prod(shape):
+    n = 1
+    for s in shape:
+        n *= s
+    return n
 
 
 class Linear(Module):
@@ -108,6 +144,12 @@ class Linear(Module):
 
     def forward(self, x):
         return x @ self.weight + self.bias
+
+    def _cost(self, in_shape):
+        if in_shape[-1] != self.in_features:
+            raise ValueError(f"Linear expects {self.in_features} input features, got shape {list(in_shape)}")
+        rows = _prod(in_shape[:-1])
+        return list(in_shape[:-1]) + [self.out_features], 2 * rows * self.in_features * self.out_features
 
     def _export_local(self, name):
         w = getattr(self, name).detach()
@@ -129,10 +171,14 @@ class ReLU(Module):
     def forward(self, x):
         return x.relu()
 
+    def _cost(self, in_shape):
+        return list(in_shape), _prod(in_shape)
+
 
 class Sequential(Module):
     def __init__(self, *layers):
         self.layers = list(layers)
+        self.layer_devices = None  # set by place(); one device per layer
 
     def _children(self):
         # PyTorch names Sequential children by index, including parameter-free ones.
@@ -140,19 +186,91 @@ class Sequential(Module):
             yield str(i), m
 
     def forward(self, x):
-        for layer in self.layers:
+        for i, layer in enumerate(self.layers):
+            if self.layer_devices is not None and x.device != self.layer_devices[i]:
+                x = x.to(self.layer_devices[i])  # differentiable: the gradient comes back
             x = layer(x)
         return x
 
+    def _cost(self, in_shape):
+        flops, shape = 0, list(in_shape)
+        for layer in self.layers:
+            shape, f = layer._cost(shape)
+            flops += f
+        return shape, flops
+
+    def graph_info(self, input_shape):
+        """Describe this chain to the planner for an input of `input_shape` (a `GraphInfo`)."""
+        shape, layers = list(input_shape), []
+        for i, layer in enumerate(self.layers):
+            shape, flops = layer._cost(shape)
+            layers.append((f"{i}:{type(layer).__name__}", 4 * layer.num_parameters(), 4 * _prod(shape), flops))
+        return _native.GraphInfo(4 * _prod(input_shape), layers)
+
+    def to(self, device):
+        super().to(device)
+        self.layer_devices = [_canonical(device)] * len(self.layers)
+        return self
+
+    def place(self, devices):
+        """Run each layer on its own device: `devices` has one entry per layer, or is a single
+        device for all, or a `ModelPlan` from `pytorches.plan_model`. Moves the parameters now, and
+        moves activations between devices in `forward` (and their gradients in `backward`). Inputs
+        may be anywhere; the output is on `output_device`, so put targets there. Build the
+        optimizer after calling this."""
+        devices = getattr(devices, "devices", devices)
+        if isinstance(devices, str):
+            devices = [devices] * len(self.layers)
+        devices = [_canonical(d) for d in devices]
+        if len(devices) != len(self.layers):
+            raise ValueError(f"got {len(devices)} device(s) for {len(self.layers)} layer(s)")
+        for layer, dev in zip(self.layers, devices):
+            layer.to(dev)
+        self.layer_devices = devices
+        return self
+
+    @property
+    def input_device(self):
+        return self.layer_devices[0] if self.layer_devices else None
+
+    @property
+    def output_device(self):
+        return self.layer_devices[-1] if self.layer_devices else None
+
 
 def mlp(sizes, device=None):
-    """`Linear -> ReLU` stack over `sizes`, e.g. `mlp([784, 256, 10])`."""
+    """`Linear -> ReLU` stack over `sizes`, e.g. `mlp([784, 256, 10])`.
+
+    `device` is one device for the whole model, or a placement (a list with one device per layer,
+    ReLUs included, or a `ModelPlan`). With a placement every layer is created directly on its
+    device, so a model too big for any one device never has to exist in one place."""
+    devices = getattr(device, "devices", device)
+    n_layers = 2 * (len(sizes) - 1) - 1
+    per_layer = devices if isinstance(devices, (list, tuple)) else [devices] * n_layers
+    if len(per_layer) != n_layers:
+        raise ValueError(f"got {len(per_layer)} device(s) for the {n_layers} layers of mlp({list(sizes)})")
     layers = []
     for i in range(len(sizes) - 1):
-        layers.append(Linear(sizes[i], sizes[i + 1], device))
+        layers.append(Linear(sizes[i], sizes[i + 1], per_layer[len(layers)]))
         if i < len(sizes) - 2:
             layers.append(ReLU())
-    return Sequential(*layers)
+    model = Sequential(*layers)
+    if isinstance(devices, (list, tuple)):
+        model.layer_devices = [_canonical(d) for d in devices]
+    return model
+
+
+def mlp_graph(sizes, batch):
+    """The planner's description of `mlp(sizes)` at `batch`, without creating any tensors."""
+    layers, shape = [], [batch, sizes[0]]
+    for i in range(len(sizes) - 1):
+        lin = (sizes[i], sizes[i + 1])
+        out = [batch, lin[1]]
+        layers.append((f"{len(layers)}:Linear", 4 * (lin[0] * lin[1] + lin[1]), 4 * _prod(out), 2 * batch * lin[0] * lin[1]))
+        shape = out
+        if i < len(sizes) - 2:
+            layers.append((f"{len(layers)}:ReLU", 0, 4 * _prod(shape), _prod(shape)))
+    return _native.GraphInfo(4 * batch * sizes[0], layers)
 
 
 def mse_loss(pred, target):

@@ -115,14 +115,24 @@ Fix the cracks now, while there is one backend. These get more expensive with ev
 - [x] Device profiling: measured bandwidth, matmul throughput, and transfer cost between every device pair, cached per machine (`pt.calibrate()`)
 - [x] Multi-device `Tensor` placement API (`device="auto"`)
 - [x] **Planner:** given a graph and device memory/speed profiles, choose placement (fits → fastest device; doesn't fit → bigger device; or split by layer)
+- [x] **`GraphInfo` + `Placement`** (`crates/core/src/graph.rs`): a model as a chain of layers (param bytes, output bytes, FLOPs), no tensors, so a strategy can price a placement before allocating anything. `Placement::report` gives per-device training bytes, transfers at each device change, and the load on the shared host-RAM pool (CPU plus every shared-memory device).
+- [x] **Placement-aware executor** (`nn.Sequential.place(devices)`, `Module.to`): parameters move to their layer's device, activations move between devices in `forward`, gradients come back through the differentiable `.to()`. Tested: every device pair plus a 5-layer bounce across cuda/xpu/cpu matches the single-device run (loss, gradients, three SGD steps).
+- [x] **Placement strategies** (`crates/core/src/strategy.rs`): `PlacementStrategy` trait, `SingleDevice` and `LayerSplit` (exhaustive over cuts and device orders, up to 3 devices), `choose()` picks the lowest estimated step time or runs one strategy by name, and says why others were declined. Strategies run against a plain-data `MachineProfile` (measured matmul speed, memory bandwidth, free memory, and pairwise transfer links), so they are unit-tested on made-up machines. Python: `pt.plan_model(model_or_graph, strategy=None)`, `nn.mlp_graph`, `nn.mlp(sizes, plan)`, `Sequential.place(plan)`; printing a `ModelPlan` explains the decision.
+- [x] **Phase 5 exit test, met on this machine** (`examples/split_model.py`): a 9.1 GiB model that does not fit the 8 GB RTX trains split across the RTX and the Arc at 224 ms/step vs 515 ms entirely on the Arc (2.3x), with losses identical to 1.2e-7.
+- [ ] Cost model accuracy: estimates run 1.4-2.3x optimistic but rank correctly. Likely causes: the Arc has no `MATMUL_T` (backward materializes transposes), per-op allocation/launch overhead, no per-layer-type efficiency. Fit a per-device efficiency factor from a short measured training step.
+- [ ] Strategy registry: register custom strategies from Rust (the trait exists) and from Python; `SpillToHost`, `Recompute`, and a concurrent pipeline (needs streams) as further strategies
+- [ ] `LayerSplit` search is exhaustive; replace with DP/branch-and-bound when devices or layers grow (cost is about layers^2 x device-orderings)
+- [ ] Transfers go through host memory (`Tensor::to`); a strategy that knows two devices share RAM (CPU + Arc) could skip a copy once the ABI can alias buffers
+- [ ] `GraphInfo` beyond a flat `Sequential` chain (branches, residuals, nested containers; each needs `_cost` and liveness)
+- [ ] Executor: move activations once per boundary even when the next layers share the device; place inputs/targets automatically; keep `.grad` and optimizer state across `place()`
 - [ ] **Spill/offload:** when a device nears OOM, evict cold tensors to host or another device instead of failing
-- [ ] Pipeline/layer offload for models larger than the fast device (hot layers on CUDA, rest on Arc)
+- [x] Pipeline/layer offload for models larger than the fast device (hot layers on CUDA, rest on Arc): `LayerSplit`, sequential stages (no overlap yet; see the next item)
 - [ ] Overlap transfers with compute using streams/events
 - [ ] Peer-to-peer or shared-memory fast paths where hardware allows
 - [x] Visualization/debug: `pt.explain_plan(model)` shows what ran where and why, plus transfer cost
 - [ ] Failure handling: device disappears or driver resets mid-run
 
-**Exit test:** run a model that doesn't fit in 8 GB using both GPUs together, faster than running it entirely on Arc, with results matching a single-device run.
+**Exit test (met, 2026-10-08, `examples/split_model.py`):** run a model that doesn't fit in 8 GB using both GPUs together, faster than running it entirely on Arc, with results matching a single-device run. The two GPUs run in turn, not at the same time; true overlap needs streams (Phase 1 ABI).
 
 ---
 
@@ -209,7 +219,7 @@ Found while building and testing the CUDA and Intel Arc plugins and the demo.
 
 **P0**
 - [x] **Out-of-memory is an error, not a panic.** The core raises a typed `Error` (`OutOfMemory` / `Invalid` / `Backend`), `try_run` catches it, and Python gets `MemoryError` / `ValueError` / `RuntimeError`. `pt.place()` retries on the next device. Remaining: make the core API return `Result` natively instead of unwinding with typed payloads.
-- [ ] **Planner must account for shared memory.** The Arc iGPU draws from system RAM, and OpenCL has no free-memory query, so its "free" figure is `total - tracked`. Combine it with host free memory (and warn when a plan could page).
+- [x] **Planner accounts for shared memory.** ABI v3 adds `DeviceInfo.flags` with `DEVICE_FLAG_SHARED_HOST_MEMORY` (the Arc plugin sets it from `CL_DEVICE_HOST_UNIFIED_MEMORY`; Metal on Apple silicon should too). The planner caps such a device's free memory at the host's, and warns when a host-resident plan needs more than half of the host's free RAM. Remaining: the CPU and the Arc draw from the same pool, so a multi-device split must count their requirements together (do this in the layer-split planner).
 - [ ] Planner decisions need a stable benchmark: calibration now warms up and takes the best of three, but add a variance check and an optional on-disk cache keyed by device + driver version.
 
 **P1**

@@ -5,8 +5,9 @@
 **One tensor library. Every GPU. No recompiling.**
 
 A PyTorch-interoperable tensor and autograd engine written in Rust. It detects your hardware
-and optimizes for it automatically. Developers can add support for new hardware by writing a
-plugin.
+and optimizes for it automatically. It uses every GPU in the machine together: it places work
+by the memory each device has free, and splits a model across devices when it won't fit on one.
+Developers can add support for new hardware by writing a plugin.
 
 ![status](https://img.shields.io/badge/status-early%20alpha-orange)
 ![rust](https://img.shields.io/badge/rust-2024-b7410e)
@@ -37,7 +38,21 @@ PyTorches turns that around:
   live in separate repos with separate release cycles. A plugin depends on one tiny
   `#![no_std]` crate (or a header, since C and C++ plugins work too).
 - **Heterogeneous machines are the target.** An 8 GB discrete GPU next to an iGPU with 47 GB
-  of shared memory should be one pool of devices, not two incompatible installs.
+  of shared memory is one pool of devices, not two incompatible installs. Out of the box,
+  with no configuration:
+  - **Multiple GPUs work together.** NVIDIA and Intel GPUs (and the CPU) are all detected and
+    usable in one process, from one install.
+  - **Work is placed by available memory.** The planner reads each device's free memory and
+    measured speed, puts a workload on the fastest device it fits on, and falls back to a
+    bigger one when it doesn't. It accounts for GPUs that share system RAM, so an iGPU is never
+    promised more memory than the host really has free.
+  - **Work is split between devices.** A model too big for the fast GPU is divided by layers
+    across devices, each layer going where it runs best, with activations and gradients moved
+    between them automatically. The result matches a single-device run. A model that fits no
+    single device can still train.
+  - **You can see and steer the decision.** Printing a plan shows which layers go where, what
+    moves between devices, and the estimated cost. Placement is a set of pluggable strategies,
+    so you can force one (`strategy="layer_split"`) when you know better.
 
 ## Architecture
 
@@ -221,6 +236,26 @@ That run then trains an 805M-parameter, 12-layer MLP on the Arc (about 0.4 s per
 doesn't fit the RTX's free memory. The speed column comes from a short matmul benchmark run through
 each plugin, so it reflects what that plugin can actually do on this machine. See
 [examples/demo.py](examples/demo.py); `--dry-run` prints only the placement decisions.
+
+**4. Using both GPUs on one model.** When a model fits no single fast device, the planner can split it
+by layers. What to do in that situation depends on the model and the machine (sizes, device speeds, the
+cost of moving data between devices), so placement is a set of strategies behind a trait
+(`PlacementStrategy`): each proposes a placement with an estimated step time, the fastest wins, and
+`plan_model(..., strategy="layer_split")` forces one. Planning needs no tensors; the model is then created
+directly on its devices:
+
+```python
+plan = pt.plan_model(pt.nn.mlp_graph([8192] * 13, batch=32))   # nothing allocated yet
+print(plan)                      # which layers go where, what moves, what it costs, what else was considered
+model = pt.nn.mlp([8192] * 13, plan)
+```
+
+The 9.1 GiB, 12-layer model above does not fit the RTX's 6.8 GiB. The plan puts layers 0-13 on the RTX
+and the rest on the Arc; it trains in about 224 ms per step against 515 ms for the same model entirely on
+the Arc, with identical losses (largest relative difference 1.2e-7). See
+[examples/split_model.py](examples/split_model.py). The step-time estimates run optimistic (127 ms
+predicted for that run, 222 ms for the Arc-only run) but rank the options correctly; the Arc's missing
+transposed matmul is part of the gap.
 
 ## Performance, honestly
 

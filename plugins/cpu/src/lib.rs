@@ -207,7 +207,7 @@ unsafe extern "C" fn device_info(device: u32, out: *mut DeviceInfo) -> Status {
     let (total, free) = host_memory().unwrap_or((MEMORY_UNKNOWN, MEMORY_UNKNOWN));
     // Cached buffers are reusable, so they count as free.
     let free = if free == MEMORY_UNKNOWN { free } else { free.saturating_add(CACHED_BYTES.load(Ordering::Relaxed) as u64).min(total) };
-    let mut info = DeviceInfo { name: [0; 64], kind: KIND_CPU, total_memory: total, free_memory: free };
+    let mut info = DeviceInfo { name: [0; 64], kind: KIND_CPU, total_memory: total, free_memory: free, flags: 0 };
     for (dst, &b) in info.name.iter_mut().zip(b"cpu") {
         *dst = b as c_char;
     }

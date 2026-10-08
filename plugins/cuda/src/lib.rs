@@ -400,7 +400,7 @@ unsafe extern "C" fn device_info(device: u32, out: *mut DeviceInfo) -> Status {
             return err(STATUS_INVALID_ARGUMENT, "null out");
         }
         let (drv, dev) = enter(device)?;
-        let mut info = DeviceInfo { name: [0; 64], kind: KIND_CUDA, total_memory: MEMORY_UNKNOWN, free_memory: MEMORY_UNKNOWN };
+        let mut info = DeviceInfo { name: [0; 64], kind: KIND_CUDA, total_memory: MEMORY_UNKNOWN, free_memory: MEMORY_UNKNOWN, flags: 0 };
         unsafe {
             drv.check((drv.device_get_name)(info.name.as_mut_ptr(), 63, dev.dev), "cuDeviceGetName")?;
             let (mut free, mut total) = (0usize, 0usize);

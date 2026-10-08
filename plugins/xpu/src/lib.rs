@@ -40,6 +40,7 @@ const CL_DEVICE_TYPE_GPU: u64 = 1 << 2;
 const CL_DEVICE_VENDOR_ID: u32 = 0x1001;
 const CL_DEVICE_MAX_MEM_ALLOC_SIZE: u32 = 0x1010;
 const CL_DEVICE_GLOBAL_MEM_SIZE: u32 = 0x101F;
+const CL_DEVICE_HOST_UNIFIED_MEMORY: u32 = 0x1035;
 const CL_DEVICE_NAME: u32 = 0x102B;
 const CL_PLATFORM_NAME: u32 = 0x0902;
 const CL_PROGRAM_BUILD_LOG: u32 = 0x1183;
@@ -209,6 +210,8 @@ struct Dev {
     name: String,
     total: u64,
     max_alloc: u64,
+    /// Integrated GPU: allocations come out of system RAM (`CL_DEVICE_HOST_UNIFIED_MEMORY`).
+    shared: bool,
     /// Bytes of all buffers created and not yet released to the runtime (in use + cached).
     allocated: AtomicU64,
     cache: Mutex<Cache>,
@@ -301,6 +304,7 @@ unsafe fn init() -> Option<Global> {
                 let name = info_string(cl.clGetDeviceInfo, d, CL_DEVICE_NAME);
                 let total = dev_u64(&cl, d, CL_DEVICE_GLOBAL_MEM_SIZE);
                 let max_alloc = dev_u64(&cl, d, CL_DEVICE_MAX_MEM_ALLOC_SIZE);
+                let shared = dev_u64(&cl, d, CL_DEVICE_HOST_UNIFIED_MEMORY) & 0xFFFF_FFFF != 0;
                 if verbose() {
                     eprintln!(
                         "[xpu] platform '{pname}' device '{name}': global_mem={} MiB max_alloc={} MiB host_ptr={host_ptr}",
@@ -315,6 +319,7 @@ unsafe fn init() -> Option<Global> {
                     name,
                     total,
                     max_alloc,
+                    shared,
                     allocated: AtomicU64::new(0),
                     cache: Mutex::new(Cache::default()),
                     host_ptr,
@@ -655,7 +660,10 @@ unsafe extern "C" fn device_info(device: u32, out: *mut DeviceInfo) -> Status {
         if out.is_null() {
             return fail(STATUS_INVALID_ARGUMENT, "null out pointer");
         }
-        let mut info = DeviceInfo { name: [0; 64], kind: KIND_XPU, total_memory: d.total, free_memory: 0 };
+        let mut info = DeviceInfo { name: [0; 64], kind: KIND_XPU, total_memory: d.total, free_memory: 0, flags: 0 };
+        if d.shared {
+            info.flags |= DEVICE_FLAG_SHARED_HOST_MEMORY;
+        }
         for (dst, &b) in info.name.iter_mut().zip(d.name.as_bytes().iter().take(63)) {
             *dst = b as c_char;
         }

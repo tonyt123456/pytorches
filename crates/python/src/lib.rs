@@ -8,6 +8,8 @@ use pyo3::buffer::PyBuffer;
 use pyo3::exceptions::{PyBufferError, PyMemoryError, PyRuntimeError, PyTypeError, PyValueError};
 use pyo3::prelude::*;
 use pyo3::types::{PyBytes, PyDict};
+use pytorches_core::graph::{GraphInfo, LayerInfo, Placement};
+use pytorches_core::strategy::{self, MachineProfile, Proposal};
 use pytorches_core::{Device, Error, Tensor, plan, plugin, try_run};
 
 #[pyclass(name = "Tensor", module = "pytorches")]
@@ -276,6 +278,7 @@ fn device_info<'py>(py: Python<'py>, device: &str) -> PyResult<Bound<'py, PyDict
     d.set_item("kind", info.kind)?;
     d.set_item("total_memory", info.total_memory)?;
     d.set_item("free_memory", info.free_memory)?;
+    d.set_item("shared_host_memory", info.shared_host_memory)?;
     Ok(d)
 }
 
@@ -339,6 +342,7 @@ fn plan_placement<'py>(py: Python<'py>, required_bytes: u64) -> PyResult<Bound<'
     out.set_item("chosen", p.chosen.to_string())?;
     out.set_item("reason", p.reason)?;
     out.set_item("may_oom", p.may_oom)?;
+    out.set_item("warnings", p.warnings)?;
     let mut cands = Vec::new();
     for c in p.candidates {
         let d = PyDict::new(py);
@@ -347,12 +351,157 @@ fn plan_placement<'py>(py: Python<'py>, required_bytes: u64) -> PyResult<Bound<'
         d.set_item("kind", c.kind)?;
         d.set_item("total_memory", c.total_memory)?;
         d.set_item("free_memory", c.free_memory)?;
+        d.set_item("shared_host_memory", c.shared_host_memory)?;
         d.set_item("gflops", c.gflops)?;
         d.set_item("fits", c.fits)?;
         cands.push(d);
     }
     out.set_item("candidates", cands)?;
     Ok(out)
+}
+
+/// A model described as a chain of layers, for placement planning. Holds no tensors.
+///
+/// `layers` is a list of `(name, param_bytes, out_bytes, flops)`.
+#[pyclass(name = "GraphInfo", module = "pytorches")]
+#[derive(Clone)]
+struct PyGraphInfo(GraphInfo);
+
+#[pymethods]
+impl PyGraphInfo {
+    #[new]
+    fn new(input_bytes: u64, layers: Vec<(String, u64, u64, u64)>) -> Self {
+        let layers = layers
+            .into_iter()
+            .map(|(name, param_bytes, out_bytes, flops)| LayerInfo { name, param_bytes, out_bytes, flops })
+            .collect();
+        PyGraphInfo(GraphInfo { input_bytes, layers })
+    }
+
+    #[getter]
+    fn input_bytes(&self) -> u64 {
+        self.0.input_bytes
+    }
+
+    /// `[(name, param_bytes, out_bytes, flops, training_bytes), ...]`
+    #[getter]
+    fn layers(&self) -> Vec<(String, u64, u64, u64, u64)> {
+        self.0
+            .layers
+            .iter()
+            .map(|l| (l.name.clone(), l.param_bytes, l.out_bytes, l.flops, l.training_bytes()))
+            .collect()
+    }
+
+    #[getter]
+    fn total_param_bytes(&self) -> u64 {
+        self.0.total_param_bytes()
+    }
+
+    #[getter]
+    fn total_training_bytes(&self) -> u64 {
+        self.0.total_training_bytes()
+    }
+
+    #[getter]
+    fn total_flops(&self) -> u64 {
+        self.0.total_flops()
+    }
+
+    /// Prices a placement (one device string per layer): returns a dict with `per_device`
+    /// (`[(device, bytes)]`), `transfers` (`[(after_layer, from, to, bytes)]`), `transfer_bytes`
+    /// and `host_pool_bytes` (the load on system RAM from the CPU and every shared-memory device).
+    fn price<'py>(&self, py: Python<'py>, devices: Vec<String>) -> PyResult<Bound<'py, PyDict>> {
+        let devs = devices.iter().map(|d| parse_device(d)).collect::<PyResult<Vec<_>>>()?;
+        let report = guard(|| Placement::new(devs).report(&self.0))?.map_err(PyValueError::new_err)?;
+        let out = PyDict::new(py);
+        out.set_item(
+            "per_device",
+            report.per_device.iter().map(|(d, b)| (d.to_string(), *b)).collect::<Vec<_>>(),
+        )?;
+        out.set_item(
+            "transfers",
+            report
+                .transfers
+                .iter()
+                .map(|t| (t.after_layer, t.from.to_string(), t.to.to_string(), t.bytes))
+                .collect::<Vec<_>>(),
+        )?;
+        out.set_item("transfer_bytes", report.transfer_bytes)?;
+        out.set_item("host_pool_bytes", report.host_pool_bytes)?;
+        Ok(out)
+    }
+}
+
+fn proposal_dict<'py>(
+    py: Python<'py>,
+    p: &Proposal,
+    machine: &MachineProfile,
+) -> PyResult<Bound<'py, PyDict>> {
+    let id = |i: usize| machine.devices[i].id.clone();
+    let d = PyDict::new(py);
+    d.set_item("strategy", &p.strategy)?;
+    d.set_item("devices", p.assignment.iter().map(|&i| id(i)).collect::<Vec<_>>())?;
+    d.set_item("est_step_secs", p.est_step_secs)?;
+    d.set_item("compute_secs", p.compute_secs)?;
+    d.set_item("transfer_secs", p.transfer_secs)?;
+    d.set_item("reason", &p.reason)?;
+    d.set_item("per_device", p.pricing.per_device.iter().map(|&(i, b)| (id(i), b)).collect::<Vec<_>>())?;
+    d.set_item("host_pool_bytes", p.pricing.host_pool_bytes)?;
+    // (after_layer, from, to, one_way_bytes, seconds for the activation and its gradient)
+    let transfers: Vec<_> = p
+        .pricing
+        .transfers
+        .iter()
+        .map(|t| {
+            let one_way = t.bytes / 2;
+            let secs = machine.link(t.from, t.to).secs(one_way) + machine.link(t.to, t.from).secs(one_way);
+            (t.after_layer, id(t.from), id(t.to), one_way, secs)
+        })
+        .collect();
+    d.set_item("transfers", transfers)?;
+    Ok(d)
+}
+
+/// Chooses a placement for `graph` by asking the placement strategies (all of them, or only the
+/// one named `strategy`). Returns a dict: `chosen` and `considered` proposals (fastest first),
+/// `declined` (`[(strategy, reason)]`) and `machine` (the measured device profiles).
+#[pyfunction]
+#[pyo3(signature = (graph, strategy=None))]
+fn plan_model<'py>(py: Python<'py>, graph: &PyGraphInfo, strategy: Option<&str>) -> PyResult<Bound<'py, PyDict>> {
+    let machine = guard(MachineProfile::measure)?;
+    let plan = strategy::choose(&strategy::default_strategies(), &graph.0, &machine, strategy)
+        .map_err(|e| match e {
+            strategy::ChooseError::Invalid(m) => PyValueError::new_err(m),
+            strategy::ChooseError::NoPlacement(m) => PyMemoryError::new_err(m),
+        })?;
+    let out = PyDict::new(py);
+    out.set_item("chosen", proposal_dict(py, &plan.chosen, &machine)?)?;
+    let considered = plan.considered.iter().map(|p| proposal_dict(py, p, &machine)).collect::<PyResult<Vec<_>>>()?;
+    out.set_item("considered", considered)?;
+    out.set_item("declined", plan.declined)?;
+    let devices = machine
+        .devices
+        .iter()
+        .map(|d| {
+            let e = PyDict::new(py);
+            e.set_item("device", &d.id)?;
+            e.set_item("name", &d.name)?;
+            e.set_item("gflops", d.gflops)?;
+            e.set_item("gbps", d.gbps)?;
+            e.set_item("free_bytes", d.free_bytes)?;
+            e.set_item("shared_host_memory", d.shared_host)?;
+            Ok(e)
+        })
+        .collect::<PyResult<Vec<_>>>()?;
+    out.set_item("machine", devices)?;
+    Ok(out)
+}
+
+/// Names of the built-in placement strategies.
+#[pyfunction]
+fn strategies() -> Vec<String> {
+    strategy::default_strategies().iter().map(|s| s.name().to_string()).collect()
 }
 
 /// Imports any object implementing `__dlpack__` (torch, numpy, jax, ...) as a CPU tensor.
@@ -408,6 +557,7 @@ fn _native(m: &Bound<'_, PyModule>) -> PyResult<()> {
     // Auto-discover plugins ($PYTORCHES_PLUGIN_DIR, set by the package; else ./plugins/bin).
     plugin::discover();
     m.add_class::<PyTensor>()?;
+    m.add_class::<PyGraphInfo>()?;
     m.add_function(wrap_pyfunction!(randn, m)?)?;
     m.add_function(wrap_pyfunction!(full, m)?)?;
     m.add_function(wrap_pyfunction!(synchronize, m)?)?;
@@ -417,6 +567,8 @@ fn _native(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(calibrate, m)?)?;
     m.add_function(wrap_pyfunction!(plugin_report, m)?)?;
     m.add_function(wrap_pyfunction!(plan_placement, m)?)?;
+    m.add_function(wrap_pyfunction!(plan_model, m)?)?;
+    m.add_function(wrap_pyfunction!(strategies, m)?)?;
     m.add_function(wrap_pyfunction!(load_plugins, m)?)?;
     m.add_function(wrap_pyfunction!(devices, m)?)?;
     m.add_function(wrap_pyfunction!(device_info, m)?)?;

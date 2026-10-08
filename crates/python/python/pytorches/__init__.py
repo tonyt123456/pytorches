@@ -35,7 +35,8 @@ from ._native import (  # noqa: E402,F401
     randn,
     synchronize,
 )
-from ._report import Plan, doctor, plan, place  # noqa: E402,F401
+from ._native import GraphInfo, strategies  # noqa: E402,F401
+from ._report import ModelPlan, Plan, doctor, plan, place, plan_model  # noqa: E402,F401
 from . import nn, optim, safetensors  # noqa: E402,F401
 from .torch_io import from_torch, from_torch_state_dict, load_torch, to_torch  # noqa: E402,F401
 
@@ -50,6 +51,7 @@ def ones(shape, device=None, requires_grad=False):
 
 __all__ = [
     "Tensor", "from_dlpack", "randn", "zeros", "ones", "full", "devices", "device_info", "load_plugins",
-    "synchronize", "calibrate", "plan", "place", "Plan", "doctor", "nn", "optim", "safetensors",
+    "synchronize", "calibrate", "plan", "place", "Plan", "plan_model", "ModelPlan", "GraphInfo",
+    "strategies", "doctor", "nn", "optim", "safetensors",
     "from_torch", "to_torch", "from_torch_state_dict", "load_torch",
 ]
