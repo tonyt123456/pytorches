@@ -23,14 +23,14 @@ jobs:
       - name: Stage plugins
         if: runner.os != 'Linux'
         shell: bash
-        run: scripts/stage-plugins.sh
+        run: bash scripts/stage-plugins.sh
       - uses: PyO3/maturin-action@v1
         with:
           working-directory: crates/python
           target: ${{ matrix.target }}
           args: --release --out dist
           manylinux: auto
-          before-script-linux: bash scripts/stage-plugins.sh
+          before-script-linux: bash ../../scripts/stage-plugins.sh
       - uses: actions/upload-artifact@v4
         with:
           name: wheels-${{ matrix.os }}
