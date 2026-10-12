@@ -23,7 +23,8 @@ def run(python, lib, device, env_extra=None):
     import os
 
     env = dict(os.environ)
-    env.setdefault("PYTORCHES_PLUGIN_DIR", str(ROOT / "plugins" / "bin"))
+    # Plugins come from normal discovery (bundled CPU + installed pytorches-<backend> packages), or from
+    # PYTORCHES_PLUGIN_DIR if you set it, e.g. to benchmark a plugin you just built.
     env["PYTHONIOENCODING"] = "utf8"
     p = subprocess.run(
         [python, str(HERE / "bench.py"), "--lib", lib, "--device", device],

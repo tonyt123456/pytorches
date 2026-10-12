@@ -1,7 +1,8 @@
 # Benchmarks: PyTorches vs PyTorch
 
 `compare.py` runs identical workloads in both libraries on every device they share and prints a table.
-`bench.py` is the single-process worker; each (library, device) pair runs in its own process so GPU
+`ops_compare.py` times individual ops (broadcast add, relu, exp, transpose copy, reductions, matmul
+variants) against PyTorch on one device to find the outliers worth fixing. `bench.py` is the single-process worker; each (library, device) pair runs in its own process so GPU
 memory, kernel JIT and caches never leak between measurements.
 
 ```powershell
@@ -19,7 +20,7 @@ python -m venv .venv-torch-cuda
 .venv-torch-cuda\Scripts\python -m pip install torch==2.13.0 --index-url https://download.pytorch.org/whl/cu132
 ```
 
-## Results (one laptop, 2026-10-06)
+## Results (one laptop; CPU rows 2026-10-06, CUDA and Arc rows re-measured 2026-10-12)
 
 NVIDIA RTX PRO 1000 Blackwell (8 GB, sm_120), Intel Arc 140T iGPU, 63 GB RAM, Windows 11.
 PyTorch 2.13.0 (`+cu132` for CUDA, `+xpu` for Arc and CPU). PyTorches at commit time of this file.
@@ -29,16 +30,16 @@ true fp32. Median of repeated runs after a time-based warm-up. The last column i
 
 | device | workload | PyTorches | PyTorch | PyTorches speed |
 |---|---|---|---|---|
-| **cuda** | matmul 2048² | 6,774 GFLOP/s | 6,678 GFLOP/s | **1.01x** |
-| | matmul 4096² | 6,478 GFLOP/s | 6,438 GFLOP/s | **1.01x** |
-| | add, 64M floats | 269-341 GB/s | 337 GB/s | 0.8-1.01x (see pitfall 4) |
-| | sum, 64M floats | 259-319 GB/s | 269-274 GB/s | 0.95-1.19x (see pitfall 4) |
-| | MLP train step (4×2048, batch 256) | 261-267 steps/s | 283 steps/s | 0.91-0.94x |
-| **xpu** (Arc) | matmul 2048² | 2,456-2,479 GFLOP/s | 4,121-4,325 GFLOP/s | 0.57-0.60x |
-| | matmul 4096² | 2,133-2,330 GFLOP/s | 4,418-4,464 GFLOP/s | 0.48-0.52x |
-| | add, 64M floats | 59-87 GB/s | 86-91 GB/s | 0.67-0.96x (see pitfall 4) |
-| | sum, 64M floats | 82-87 GB/s | 86-87 GB/s | 0.95-1.01x |
-| | MLP train step | 96-98 steps/s | 119-132 steps/s | 0.74-0.80x |
+| **cuda** | matmul 2048² | 7,043-7,107 GFLOP/s | 6,975-7,146 GFLOP/s | 0.99-1.02x |
+| | matmul 4096² | 6,898-7,110 GFLOP/s | 6,269-7,084 GFLOP/s | 0.98-1.13x |
+| | add, 64M floats | 266-340 GB/s | 334-338 GB/s | 0.79-1.01x (see pitfall 4) |
+| | sum, 64M floats | 261-324 GB/s | 272-315 GB/s | 0.83-1.19x (see pitfall 4) |
+| | MLP train step (4×2048, batch 256) | 264-281 steps/s | 289-296 steps/s | 0.91-0.96x |
+| **xpu** (Arc) | matmul 2048² | 3,208-3,447 GFLOP/s | 2,948-4,314 GFLOP/s | 0.80-1.12x (see pitfall 6) |
+| | matmul 4096² | 2,958-3,315 GFLOP/s | 3,253-4,442 GFLOP/s | 0.75-0.94x (see pitfall 6) |
+| | add, 64M floats | 79-86 GB/s | 76-87 GB/s | 0.99-1.05x |
+| | sum, 64M floats | 82-84 GB/s | 64-86 GB/s | 0.95-1.29x |
+| | MLP train step | 107-111 steps/s | 123-128 steps/s | 0.84-0.87x |
 | **cpu** (16 threads) | matmul 512² | 541-805 GFLOP/s | 468-874 GFLOP/s | 0.92-1.72x |
 | | matmul 1024² | 693-763 GFLOP/s | 579-637 GFLOP/s | 1.16-1.22x |
 | | add, 8M floats | 67-78 GB/s | 64-72 GB/s | 1.01-1.17x |
@@ -60,29 +61,42 @@ true fp32. Median of repeated runs after a time-based warm-up. The last column i
   that don't need one (the first layer's data), and the SGD update is one fused `AXPY` pass per tensor
   instead of a multiply, a subtract and a copy. Profile of one step before/after: forward 1.2 ms,
   backward 2.95 -> 2.1 ms, optimizer 1.26 -> 0.45 ms. The remaining gap is per-op launch overhead.
-- **Arc: elementwise ops and `sum` are at parity, matmul is at ~0.5-0.6x, and a training step is at
-  0.74-0.80x** (it started the day at 0.19x, 0.23x and 0.26x for add, matmul and the step). What did it:
+- **Arc: elementwise ops and `sum` are at parity or ahead, matmul is at 0.75-1.1x of PyTorch (depending on
+  the iGPU's power state, see pitfall 6), and a training step is at 0.84-0.87x.** The same Arc started the
+  first day at 0.19x, 0.23x and 0.26x for add, matmul and the step, then 0.55x for matmul and the step on
+  the second. What did it, in the order it paid off:
   - A caching allocator (every `a + b` used to create and commit a fresh 256 MB buffer): `add` 17 -> 80+ GB/s.
-  - A sub-group matmul kernel (N % 32, K % 16; whole 16-row blocks, the leftover rows use the general
-    kernel): 1.1 -> 2.3-2.5 TFLOP/s, about 2x. Other shapes use the older general kernel.
-  - A fused `AXPY` optimizer update: the SGD step 4.2 -> 1.8 ms.
-  - A tiled local-memory transpose for `COPY`s that are 2-D transposes (what backward produces):
-    42 -> 61-64 GB/s.
-  - 4-wide loads in the row `sum`: 68 -> 82-87 GB/s.
-- **The Arc matmul gap is vector-unit efficiency, not matrix engines.** fp32 matmul in PyTorch runs on the
-  ordinary vector units here: a pure-FMA kernel measures a **4.1 TFLOP/s** fp32 peak on this Arc 140T
-  (128 EUs), and PyTorch reaches 4.0-4.3 of it. Intel's matrix instructions (`DPAS`, advertised through
-  `cl_intel_subgroup_matrix_multiply_accumulate`) take fp16/bf16/int8, not fp32, so they matter only for a
-  reduced-precision path. Our kernel is at ~58% of the vector peak. Tried, and none beat ~2.4-2.5 TFLOP/s:
-  wider or narrower register tiles, sharing B across a work-group, tile-order swizzles, register
-  prefetch (spills the 128-register file), hardware `prefetch()`, the 256-GRF mode (halves occupancy) and
-  32-bit index math. Ruled out as the cause by measurement: spills (0 bytes), cache aliasing (non-power-of-two
-  strides behave the same), cache capacity (a cache-resident B is no faster), FMA issue and broadcasts
-  (removing half the FMAs left the time unchanged). That leaves the load path itself; what is still untried
-  is local-memory staging and Intel's 2-D block loads, which this driver does not expose
-  (`cl_intel_subgroup_2d_block_io` is not advertised). A transposed-B kernel (each lane loading its own
-  column's k-values) was correct but 4x slower (0.6 TFLOP/s), so backward still materializes transposes on
-  Arc, now through the faster transpose kernel.
+  - **A rewritten matmul schedule: 2.3 -> 3.4 TFLOP/s (0.53x -> ~0.8x).** Found by disassembling the
+    compiled kernel (`tools/isa.py` in the xpu plugin repo, using Intel's IGA from the driver store) rather
+    than by trying variants of the source. The listing showed the B loads issued right before the FMAs that
+    use them, so every k step waited on a full cache round trip. Three changes: B loads now run two steps
+    ahead through a small register ring; work-groups run in a grouped order so tiles in flight together
+    share a compact block of A and B (plain raster order streams all of B for every wave: this alone is
+    worth 1.5-1.7x at 4096); and offsets are 32-bit (64-bit index math was ~7 scalar instructions per A
+    load and ~30 per B load; on its own this changed nothing, which is why it had been ruled out before).
+  - `MATMUL_T`: the backward pass no longer materializes a transposed copy of every weight. For `A B^T`
+    with a small batch the plugin computes `C^T = B A^T` and transposes the small activation and the small
+    result instead. Training step +12% (88 -> 101 steps/s, interleaved A/B runs).
+  - float4 elementwise kernels: add 0.85x -> 1.08x, exp 0.77 -> 0.96, relu 0.74 -> 0.98, tanh 0.69 -> 0.96.
+  - The fast matmul now covers any shape: a K tail runs in the kernel and leftover rows and columns go to
+    the general kernel (1000³: 1.7 -> 1.1 ms; the rest is unaligned 4000-byte row strides).
+  - A fused `AXPY` optimizer update (SGD step 4.2 -> 1.8 ms), a tiled local-memory transpose (42 -> 61-64
+    GB/s) and 4-wide loads in the row `sum` (68 -> 82-87 GB/s).
+- **Where the Arc matmul stands, and why it stops there.** Removing every load from the new kernel leaves
+  4.7-4.9 TFLOP/s of FMA throughput (a ceiling for this instruction stream), so the remaining gap is load
+  traffic: a 16 x 32 tile moves 192 bytes per 1024 FLOP, about 75% of an Xe core's L1 bandwidth at full
+  FMA rate. A 32-row tile halves that, but needs the 256-register mode (acc 128 + A 64 registers), and the
+  compiler spills there (61-226 scratch operations in the loop). A SIMD8 variant (half the A registers) was
+  no better (3.1 TFLOP/s). What PyTorch's oneMKL kernel has that this one cannot: 2-D block loads, which
+  the driver does not expose to OpenCL. Ruled out by measurement along the way: the scalar broadcast of A
+  (same speed without it), A loads (7% of the time), compiler flags (`-cl-fast-relaxed-math`, large-GRF
+  modes: no change), and L1 traffic alone (a taller tile that did not spill would be the test).
+  `tools/matmul_bench.py` and `tools/matmul_variants.cl` reproduce the search.
+- **CUDA, after the same kind of per-op comparison** (`ops_compare.py`): the 2-D transpose copy went from
+  0.56x to 0.93x with a tiled kernel, and a bias-style broadcast add from 0.70x to 1.12x with a kernel that
+  has no per-element division. Everything else measured is within 10% of PyTorch (reductions 0.91-0.96x).
+  Host overhead is not the gap: a CUDA op costs the host 11-17 us against PyTorch's 13-15, and enqueueing a
+  whole training step takes 0.3 ms against PyTorch's 0.95 ms.
 - **CPU is at parity with MKL** (it started 10-50x behind: single-threaded scalar kernels, a fresh
   allocation per op). What changed, in the order it paid off:
   - Threads plus AVX2/FMA inner loops for elementwise ops, in place for broadcasts (the old code copied
@@ -138,3 +152,14 @@ Written down because they produced a wrong headline once:
    swing. Fork-join libraries stall when a worker is descheduled mid-task. Compare medians of repeated
    runs, close other applications for a number you intend to keep, and treat the ranges in the table as
    the result rather than any single run.
+6. **The iGPU's power state moves PyTorch's numbers as much as ours.** On the same day, PyTorch's own XPU
+   matmul measured between 2.9 and 4.4 TFLOP/s depending on how long the machine had been busy (shared
+   power and thermal budget with the CPU). The Arc ratios are therefore wide ranges, and a result worth
+   keeping needs interleaved runs of both libraries, not one after the other.
+7. **Measure the same way on both sides of a comparison.** A direct-OpenCL harness reporting the best of
+   30 runs read 3.5 TFLOP/s for a kernel that the benchmark's medians put at 3.4 through the plugin and
+   at 2.4 before the change; and a timing loop that enqueues without synchronizing queues thousands of
+   kernels and measures nothing (`bench.py` syncs every few calls for that reason).
+8. **Look at the machine code before theorizing.** Four plausible explanations for the Arc matmul gap
+   (broadcast cost, scalar address math, L1 traffic, register spills) were each tested and each changed
+   nothing; the compiled listing showed the real one in a minute.
