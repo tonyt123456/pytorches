@@ -552,10 +552,30 @@ fn tensor_to_bytes<'py>(py: Python<'py>, t: &PyTensor) -> PyResult<Bound<'py, Py
     Ok(PyBytes::new(py, &bytes))
 }
 
+/// Run by probe children: loads one plugin library, prints what it sees (see `plugin::probe_main`).
+const PROBE_SNIPPET: &str = "import sys; from pytorches import _native; print(_native.probe_plugin(sys.argv[1]))";
+
+/// Probe-child entry point: the text `plugin::probe_main` produces for the library at `path`.
+#[pyfunction]
+fn probe_plugin(path: &str) -> String {
+    plugin::probe_main(std::path::Path::new(path))
+}
+
 #[pymodule]
 fn _native(m: &Bound<'_, PyModule>) -> PyResult<()> {
-    // Auto-discover plugins ($PYTORCHES_PLUGIN_DIR, set by the package; else ./plugins/bin).
-    plugin::discover();
+    // Probe children only load one plugin on request; they must not discover (or spawn) anything.
+    if !plugin::is_probe_child() {
+        // Candidate plugins are first loaded in a throwaway interpreter, so a crashing or hanging
+        // vendor driver cannot take this process down.
+        let exe = m.py().import("sys").and_then(|s| s.getattr("executable")).and_then(|e| e.extract::<String>());
+        if let Ok(exe) = exe
+            && !exe.is_empty()
+        {
+            plugin::set_probe_command(vec![exe, "-c".into(), PROBE_SNIPPET.into()]);
+        }
+        // Auto-discover plugins ($PYTORCHES_PLUGIN_DIR, set by the package; else ./plugins/bin).
+        plugin::discover();
+    }
     m.add_class::<PyTensor>()?;
     m.add_class::<PyGraphInfo>()?;
     m.add_function(wrap_pyfunction!(randn, m)?)?;
@@ -566,6 +586,7 @@ fn _native(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(tensor_to_bytes, m)?)?;
     m.add_function(wrap_pyfunction!(calibrate, m)?)?;
     m.add_function(wrap_pyfunction!(plugin_report, m)?)?;
+    m.add_function(wrap_pyfunction!(probe_plugin, m)?)?;
     m.add_function(wrap_pyfunction!(plan_placement, m)?)?;
     m.add_function(wrap_pyfunction!(plan_model, m)?)?;
     m.add_function(wrap_pyfunction!(strategies, m)?)?;

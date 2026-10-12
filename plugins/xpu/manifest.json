@@ -1,0 +1,12 @@
+{
+  "name": "xpu",
+  "vendor": "intel",
+  "abi": 4,
+  "os": [
+    "windows",
+    "linux"
+  ],
+  "arch": [
+    "x86_64"
+  ]
+}

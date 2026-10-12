@@ -14,5 +14,7 @@ Get-ChildItem (Join-Path $root "plugins") -Directory | Where-Object { Test-Path 
     if ($LASTEXITCODE -ne 0) { throw "plugin $name failed to build" }
     $lib = Join-Path $root "target/$Profile/pytorches_plugin_$($name.Replace('-','_')).dll"
     Copy-Item $lib $bin -Force
+    $manifest = Join-Path $_.FullName "manifest.json"
+    if (Test-Path $manifest) { Copy-Item $manifest (Join-Path $bin "pytorches_plugin_$($name.Replace('-','_')).json") -Force }
 }
 Get-ChildItem $bin

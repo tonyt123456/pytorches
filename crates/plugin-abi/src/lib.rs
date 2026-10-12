@@ -7,7 +7,11 @@
 //! built with any compiler version, or in C/C++.
 //!
 //! # Contract
-//! * The core checks `abi_version` (the first field) before touching anything else.
+//! * The core checks `abi_version` and `struct_size` (the first two fields) before touching
+//!   anything else. `abi_version` is the *major* version: it changes only for a breaking layout
+//!   change. Backward-compatible additions are fields appended to [`PluginVTable`]; a plugin built
+//!   against an older header simply has a smaller `struct_size`, and the core only reads appended
+//!   fields the table is large enough to contain.
 //! * Plugins own their device memory. The core only holds opaque pointers and calls
 //!   `alloc`/`free`/`copy_*`. Cross-device copies are staged through host memory by the core.
 //! * `execute` runs one op. The core allocates the output buffers (via `alloc`) and does
@@ -21,13 +25,19 @@
 //!   `free` must be safe while earlier work that uses the buffer is still in flight.
 //!   (Explicit streams can be added later as appended fields.)
 //!
-//! Adding ops or fields in a backward-compatible way means appending to the op list or
-//! bumping `ABI_VERSION`; plugins advertise which ops they implement via `supports_op`.
+//! Adding ops or fields in a backward-compatible way means appending to the op list or to the
+//! vtable (no version bump); a layout break bumps `ABI_VERSION`. Plugins advertise which ops they
+//! implement via `supports_op`.
 #![no_std]
 
 use core::ffi::{c_char, c_void};
 
-pub const ABI_VERSION: u32 = 3;
+pub const ABI_VERSION: u32 = 4;
+/// `size_of::<PluginVTable>()` for this header. Plugins store it in `PluginVTable::struct_size`;
+/// the core rejects tables smaller than the fields it needs.
+pub const VTABLE_SIZE: u32 = core::mem::size_of::<PluginVTable>() as u32;
+/// Size of the leading `(abi_version, struct_size)` pair, readable from any ABI major version.
+pub const VTABLE_HEADER_SIZE: u32 = 8;
 /// NUL-terminated name of the exported entry function (`EntryFn`).
 pub const ENTRY_SYMBOL: &[u8] = b"pytorches_plugin_entry\0";
 /// Required file-name prefix for plugin libraries in the plugin directory.
@@ -143,6 +153,8 @@ pub const DEVICE_FLAG_SHARED_HOST_MEMORY: u32 = 1 << 0;
 pub struct PluginVTable {
     /// Must be [`ABI_VERSION`]. Keep this the first field.
     pub abi_version: u32,
+    /// `size_of` the vtable the plugin was built against ([`VTABLE_SIZE`]). Keep this the second field.
+    pub struct_size: u32,
     pub plugin_version: u32,
     /// Static NUL-terminated plugin name, e.g. `"cpu"`, `"cuda"`. Used in device strings (`cuda:0`).
     pub name: *const c_char,

@@ -293,13 +293,42 @@ existing hardware, without touching the core.
 1. `cargo new --lib plugins/<name>`, set `crate-type = ["cdylib"]`, depend on
    [`pytorches-plugin-abi`](crates/plugin-abi/src/lib.rs). The crate is the full contract
    and is documented inline. Implementing the same struct from C works too.
-2. Export `pytorches_plugin_entry() -> *const PluginVTable`.
+2. Export `pytorches_plugin_entry() -> *const PluginVTable`, with `abi_version: ABI_VERSION` and
+   `struct_size: VTABLE_SIZE` filled in.
 3. Implement the vtable. [`plugins/cpu`](plugins/cpu/src/lib.rs) is a complete reference
    in about 270 lines.
 4. `.\scripts\build-plugins.ps1` copies `pytorches_plugin_<name>.dll` into `plugins/bin`.
-5. Run the differential tests. If they pass, your backend is correct.
+5. Optionally add a manifest, `pytorches_plugin_<name>.json`, next to the library (copy
+   [`plugins/cuda/manifest.json`](plugins/cuda/manifest.json)). Its `abi`, `os` and `arch` are checked
+   before the library is loaded, so a plugin that cannot apply to this machine is skipped without
+   running any of its code.
+6. Run the differential tests. If they pass, your backend is correct.
 
-ABI evolution: ops are append-only. A layout change bumps `ABI_VERSION`.
+**Shipping a plugin as its own package.** Put the library and its manifest inside a Python package
+and declare it with an entry point; `import pytorches` finds it with no configuration:
+
+```toml
+[project.entry-points."pytorches.plugins"]
+cuda = "pytorches_cuda"   # a module whose directory holds pytorches_plugin_cuda.{dll,so}
+```
+
+The module is located but never imported, so discovery runs none of its Python code. Plugins
+bundled in the main wheel are searched first. Setting `PYTORCHES_PLUGIN_DIR` (a path list)
+overrides all discovery, which is what you want while developing against a specific build.
+`pt.doctor()` shows the hardware it detects and, for each GPU, whether a plugin loaded, was found
+but skipped (with the reason), or is not installed.
+
+**How plugins are loaded.** Each candidate library passes three gates: the manifest (no code runs),
+then a probe in a throwaway child process with a timeout (so a driver that hangs or crashes on init
+cannot take your program down; a plugin with no devices is skipped here too), then the real load.
+Probe outcomes are cached in the per-user cache directory (`PYTORCHES_CACHE_DIR` to move it;
+successes for 24 h, failures for 10 min, and a rebuilt library is always re-probed).
+`PYTORCHES_PROBE=off` loads in-process without the probe, `PYTORCHES_PROBE_CACHE=off` ignores the
+cache, and `PYTORCHES_PROBE_TIMEOUT=<seconds>` (default 20) bounds the child.
+
+ABI evolution: ops are append-only. New vtable fields are appended without a version bump; a
+plugin built against an older header has a smaller `struct_size` and the core reads only what it
+contains. A layout break bumps `ABI_VERSION` (now 4).
 
 ## Repository layout
 

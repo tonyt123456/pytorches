@@ -173,6 +173,14 @@ Fix the cracks now, while there is one backend. These get more expensive with ev
 - [ ] Apple Metal plugin (placeholder crate `plugins/metal` exists; reports no devices)
 - [ ] Google TPU via StableHLO/XLA plugin
 - [ ] Intel NPU plugin (inference only, static shapes, OpenVINO / Level Zero NPU)
+- [x] **Forward-compatible ABI header** (ABI 4): `struct_size` after `abi_version`; the core accepts larger tables and reads only the fields a table contains
+- [x] **Plugin manifest** (`pytorches_plugin_<name>.json`: abi/os/arch checked before any code is loaded)
+- [x] **Isolated probe**: candidates are loaded in a child process with a timeout; crash, hang or no devices skips the plugin; outcomes cached on disk (`PYTORCHES_PROBE`, `_PROBE_CACHE`, `_PROBE_TIMEOUT`, `PYTORCHES_CACHE_DIR`)
+- [x] Entry-point discovery of pip-installed plugins (`pytorches.plugins` group; the module is located, not imported) alongside the bundled directory
+- [x] `doctor()` detects GPUs without any plugin (sysfs PCI on Linux, WMI on Windows, arm64 on macOS) and says per GPU: plugin loaded, plugin found but skipped (and why), or no plugin installed
+- [ ] Manifest `runtime_libs` / PCI-id fields so the loader can skip a plugin whose hardware is absent without a probe; driver versions in `doctor()`; macOS Intel GPUs; PCI-id name lookup on Linux
+- [ ] Publish the first standalone plugin package (`pytorches-cuda` etc.) to exercise entry-point discovery end to end; the `pytorches-<name>` naming in `doctor()` hints is a convention until then
+- [ ] `pytorches install-backend <name>` (explicit; never install at import) and a trust allowlist for third-party plugins
 - [ ] **Hardware detection** (`pt.doctor()`): report GPUs, drivers, which plugins match
 - [ ] **On-demand plugin download:** signed manifest mapping (OS, arch, driver, compute capability) → plugin build; hash-pinned cache in `~/.cache/pytorches/plugins`
 - [ ] Offline/air-gapped mode and lockfile recording the resolved plugin set (reproducibility)

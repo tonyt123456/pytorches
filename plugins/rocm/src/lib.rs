@@ -65,6 +65,7 @@ unsafe extern "C" fn last_error() -> *const c_char {
 
 static VTABLE: PluginVTable = PluginVTable {
     abi_version: ABI_VERSION,
+    struct_size: VTABLE_SIZE,
     plugin_version: 0,
     name: c"rocm".as_ptr(),
     device_count,

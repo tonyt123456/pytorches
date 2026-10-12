@@ -110,7 +110,7 @@ dependencies = [
 
 [[package]]
 name = "pytorches-core"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "libloading",
  "pytorches-plugin-abi",
@@ -119,18 +119,18 @@ dependencies = [
 
 [[package]]
 name = "pytorches-plugin-abi"
-version = "0.1.0"
+version = "0.2.0"
 
 [[package]]
 name = "pytorches-plugin-cpu"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "pytorches-plugin-abi",
 ]
 
 [[package]]
 name = "pytorches-plugin-cuda"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "libloading",
  "pytorches-core",
@@ -139,21 +139,21 @@ dependencies = [
 
 [[package]]
 name = "pytorches-plugin-metal"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "pytorches-plugin-abi",
 ]
 
 [[package]]
 name = "pytorches-plugin-rocm"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "pytorches-plugin-abi",
 ]
 
 [[package]]
 name = "pytorches-plugin-xpu"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "libloading",
  "pytorches-core",
@@ -162,7 +162,7 @@ dependencies = [
 
 [[package]]
 name = "pytorches-python"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "pyo3",
  "pytorches-core",

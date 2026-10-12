@@ -10,6 +10,8 @@ for dir in "$root"/plugins/*/; do
     [ -f "$dir/Cargo.toml" ] || continue
     [ "$name" = bin ] && continue
     cargo build --release -p "pytorches-plugin-$name" --manifest-path "$root/Cargo.toml"
+    # The manifest travels beside the library so the loader can skip a plugin without loading it.
+    [ -f "$dir/manifest.json" ] && cp "$dir/manifest.json" "$dest/pytorches_plugin_${name//-/_}.json"
 done
 shopt -s nullglob
 for f in "$root"/target/release/pytorches_plugin_*.{dll,so,dylib} "$root"/target/release/libpytorches_plugin_*.{so,dylib}; do

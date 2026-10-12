@@ -4,23 +4,12 @@ Hardware support is automatic: at import, the runtime loads every device plugin 
 keeps the ones whose own hardware test finds usable devices.
 """
 
-import os as _os
 import pathlib as _pathlib
 
+from . import _discover
 
-def _locate_plugins():
-    """Point the runtime at the plugin directory unless the user already did."""
-    if _os.environ.get("PYTORCHES_PLUGIN_DIR"):
-        return
-    here = _pathlib.Path(__file__).resolve().parent
-    candidates = [here / "plugins"] + [p / "plugins" / "bin" for p in list(here.parents)[:5]]
-    for cand in candidates:
-        if cand.is_dir():
-            _os.environ["PYTORCHES_PLUGIN_DIR"] = str(cand)
-            return
-
-
-_locate_plugins()
+# Bundled plugins plus any installed plugin packages (entry point group "pytorches.plugins").
+_discover.locate_plugins(_pathlib.Path(__file__).resolve().parent)
 
 from . import _native  # noqa: E402  (must come after _locate_plugins)
 from ._native import (  # noqa: E402,F401

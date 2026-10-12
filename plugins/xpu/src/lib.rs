@@ -1108,6 +1108,7 @@ unsafe extern "C" fn execute(
 
 static VTABLE: PluginVTable = PluginVTable {
     abi_version: ABI_VERSION,
+    struct_size: VTABLE_SIZE,
     plugin_version: 1,
     name: c"xpu".as_ptr(),
     device_count,

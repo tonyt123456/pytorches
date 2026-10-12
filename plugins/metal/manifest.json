@@ -1,0 +1,12 @@
+{
+  "name": "metal",
+  "vendor": "apple",
+  "abi": 4,
+  "os": [
+    "macos"
+  ],
+  "arch": [
+    "aarch64",
+    "x86_64"
+  ]
+}

@@ -1,8 +1,10 @@
 """Human-readable reports: hardware detection (`doctor`) and placement decisions (`plan`)."""
 
-from . import _native
+import os
 
-_KINDS = {0: "cpu", 1: "cuda", 2: "rocm", 3: "xpu", 4: "npu"}
+from . import _discover, _hardware, _native
+
+_KINDS = {0: "cpu", 1: "cuda", 2: "rocm", 3: "xpu", 4: "npu", 5: "metal"}
 
 
 def _bytes(n):
@@ -145,15 +147,27 @@ def plan_model(model, input_shape=None, strategy=None):
 def doctor(benchmark=True):
     """Print what PyTorches found on this machine and which backends it loaded."""
     print("PyTorches doctor")
-    print("\nplugins:")
     report = _native.plugin_report()
+
+    print("\nhardware:")
+    found = _hardware.diagnose(_hardware.detect_hardware(), report)
+    if not found:
+        print("  (no GPU detected)")
+    for hw, status, message in found:
+        print(f"  {status:<7}  {hw['vendor']:<8} {hw['name'][:44]:<44} {message}")
+
+    print("\nplugins:")
+    searched = os.environ.get("PYTORCHES_PLUGIN_DIR", "")
+    print(f"  searched: {searched or '(nothing; set PYTORCHES_PLUGIN_DIR)'}")
+    for name, dirs in _discover.entry_point_plugins():
+        print(f"  package   {name:<6} ({', '.join(str(d) for d in dirs)})")
     if not report:
-        print("  (none found; set PYTORCHES_PLUGIN_DIR)")
+        print("  (no plugin libraries found)")
     for file, loaded, err in report:
         if loaded:
             print(f"  loaded   {loaded:<6} ({file})")
         else:
-            print(f"  skipped  {file}: {err.split(': ')[-1]}")
+            print(f"  skipped  {file}: {err.split(file + ': ', 1)[-1]}")
     print("\ndevices:")
     for dev in _native.devices():
         info = _native.device_info(dev)

@@ -1,0 +1,12 @@
+{
+  "name": "rocm",
+  "vendor": "amd",
+  "abi": 4,
+  "os": [
+    "windows",
+    "linux"
+  ],
+  "arch": [
+    "x86_64"
+  ]
+}
