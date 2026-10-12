@@ -17,9 +17,6 @@ import zipfile
 
 import torch
 
-os.environ.setdefault(
-    "PYTORCHES_PLUGIN_DIR", str(pathlib.Path(__file__).resolve().parents[2] / "plugins" / "bin")
-)
 import pytorches as pt
 
 try:

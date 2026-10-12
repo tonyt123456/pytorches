@@ -179,7 +179,8 @@ Fix the cracks now, while there is one backend. These get more expensive with ev
 - [x] Entry-point discovery of pip-installed plugins (`pytorches.plugins` group; the module is located, not imported) alongside the bundled directory
 - [x] `doctor()` detects GPUs without any plugin (sysfs PCI on Linux, WMI on Windows, arm64 on macOS) and says per GPU: plugin loaded, plugin found but skipped (and why), or no plugin installed
 - [ ] Manifest `runtime_libs` / PCI-id fields so the loader can skip a plugin whose hardware is absent without a probe; driver versions in `doctor()`; macOS Intel GPUs; PCI-id name lookup on Linux
-- [ ] Publish the first standalone plugin package (`pytorches-cuda` etc.) to exercise entry-point discovery end to end; the `pytorches-<name>` naming in `doctor()` hints is a convention until then
+- [x] First standalone plugin packages: `pytorches-cuda` (on PyPI) and `pytorches-xpu` (own repos, `plugins/cuda` and `plugins/xpu` removed from this repo; install via the `cuda` / `xpu` / `gpu` extras)
+- [ ] Move the ROCm and Metal placeholders out the same way when they get real implementations
 - [ ] `pytorches install-backend <name>` (explicit; never install at import) and a trust allowlist for third-party plugins
 - [ ] **Hardware detection** (`pt.doctor()`): report GPUs, drivers, which plugins match
 - [ ] **On-demand plugin download:** signed manifest mapping (OS, arch, driver, compute capability) → plugin build; hash-pinned cache in `~/.cache/pytorches/plugins`

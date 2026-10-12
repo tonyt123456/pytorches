@@ -14,7 +14,14 @@ for dir in "$root"/plugins/*/; do
     [ -f "$dir/manifest.json" ] && cp "$dir/manifest.json" "$dest/pytorches_plugin_${name//-/_}.json"
 done
 shopt -s nullglob
-for f in "$root"/target/release/pytorches_plugin_*.{dll,so,dylib} "$root"/target/release/libpytorches_plugin_*.{so,dylib}; do
-    cp "$f" "$dest/"
+# Copy only the plugins built above, so stale libraries left in target/release are not bundled.
+for dir in "$root"/plugins/*/; do
+    name="$(basename "$dir")"
+    [ -f "$dir/Cargo.toml" ] || continue
+    [ "$name" = bin ] && continue
+    lib="pytorches_plugin_${name//-/_}"
+    for f in "$root/target/release/$lib".{dll,so,dylib} "$root/target/release/lib$lib".{so,dylib}; do
+        [ -f "$f" ] && cp "$f" "$dest/"
+    done
 done
 ls -l "$dest"

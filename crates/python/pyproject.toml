@@ -17,6 +17,13 @@ classifiers = [
     "Topic :: Scientific/Engineering :: Artificial Intelligence",
 ]
 
+# GPU backends are separate packages; the core stays small and vendor-neutral. Each one is found
+# automatically once installed (see "pytorches.plugins" entry points).
+[project.optional-dependencies]
+cuda = ["pytorches-cuda"]
+xpu = ["pytorches-xpu"]
+gpu = ["pytorches-cuda", "pytorches-xpu"]
+
 [project.urls]
 Repository = "https://github.com/tonyt123456/pytorches"
 

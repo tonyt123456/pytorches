@@ -129,15 +129,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "pytorches-plugin-cuda"
-version = "0.2.0"
-dependencies = [
- "libloading",
- "pytorches-core",
- "pytorches-plugin-abi",
-]
-
-[[package]]
 name = "pytorches-plugin-metal"
 version = "0.2.0"
 dependencies = [
@@ -148,15 +139,6 @@ dependencies = [
 name = "pytorches-plugin-rocm"
 version = "0.2.0"
 dependencies = [
- "pytorches-plugin-abi",
-]
-
-[[package]]
-name = "pytorches-plugin-xpu"
-version = "0.2.0"
-dependencies = [
- "libloading",
- "pytorches-core",
  "pytorches-plugin-abi",
 ]
 

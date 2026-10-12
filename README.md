@@ -101,6 +101,21 @@ inspects hardware itself, supporting a new accelerator never touches the core.
 - `execute` returns a status code. Nothing Rust-specific (no `Vec`, `String`, `Box`)
   crosses the boundary.
 
+## Install
+
+```
+pip install pytorches-universe              # core + CPU backend
+pip install "pytorches-universe[cuda]"      # + NVIDIA (pytorches-cuda)
+pip install "pytorches-universe[xpu]"       # + Intel GPUs (pytorches-xpu)
+pip install "pytorches-universe[gpu]"       # both
+```
+
+GPU backends are separate packages, so you only install what your machine can use. Each is found
+automatically on the next `import pytorches`; `pt.doctor()` shows what was detected and which
+plugin is missing. Their repositories:
+[pytorches-cuda](https://github.com/tonyt123456/pytorches-cuda),
+[pytorches-xpu](https://github.com/tonyt123456/pytorches-xpu).
+
 ## Quick start
 
 Requires Rust (stable), the MSVC build tools on Windows, and Python 3.11+.
@@ -115,7 +130,13 @@ cargo test                                    # core tests (CPU plugin linked st
 python -m venv .venv --system-site-packages
 .venv\Scripts\python -m pip install maturin
 cd crates\python; ..\..\.venv\Scripts\maturin develop --release; cd ..\..
+
+# GPU backends live in their own repos; install the ones your machine has to run the GPU tests
+.venv\Scripts\python -m pip install pytorches-cuda pytorches-xpu
 ```
+
+(Developing a backend? Build it from its repo and `pip install` the wheel, or point
+`PYTORCHES_PLUGIN_DIR` at its build output.)
 
 Then train a small MLP. Nothing in the script names a device:
 
@@ -299,7 +320,7 @@ existing hardware, without touching the core.
    in about 270 lines.
 4. `.\scripts\build-plugins.ps1` copies `pytorches_plugin_<name>.dll` into `plugins/bin`.
 5. Optionally add a manifest, `pytorches_plugin_<name>.json`, next to the library (copy
-   [`plugins/cuda/manifest.json`](plugins/cuda/manifest.json)). Its `abi`, `os` and `arch` are checked
+   [`plugins/cpu/manifest.json`](plugins/cpu/manifest.json)). Its `abi`, `os` and `arch` are checked
    before the library is loaded, so a plugin that cannot apply to this machine is skipped without
    running any of its code.
 6. Run the differential tests. If they pass, your backend is correct.
@@ -338,8 +359,8 @@ contains. A layout break bumps `ABI_VERSION` (now 4).
 | `crates/core` | `Tensor`, reverse-mode autograd, device registry, plugin loader. |
 | `crates/python` | PyO3 bindings plus the Python package (`nn`, `optim`, `doctor`, `plan`), built with maturin. |
 | `plugins/cpu` | Reference backend. |
-| `plugins/cuda` | NVIDIA via the CUDA driver API (`nvcuda.dll`), with committed PTX kernels. Needs only the driver. |
-| `plugins/xpu` | Intel GPUs via the OpenCL runtime in the Intel graphics driver. |
+| [`pytorches-cuda`](https://github.com/tonyt123456/pytorches-cuda) | (separate repo) NVIDIA via the CUDA driver API, with committed PTX kernels. Needs only the driver. |
+| [`pytorches-xpu`](https://github.com/tonyt123456/pytorches-xpu) | (separate repo) Intel GPUs via the OpenCL runtime in the Intel graphics driver. |
 | `plugins/rocm`, `plugins/metal` | Placeholders for AMD and Apple GPUs. They load but report no devices. |
 | `plugins/bin` | Built plugin libraries; the runtime scans this directory. |
 | `tests/diff` | Differential tests against PyTorch. |
@@ -354,7 +375,7 @@ matmul is tiled but untuned, there is no fusion), and the op set is small.
 
 - `f32` tensors; add/sub/mul/div with broadcasting; neg, exp, log, relu, tanh
 - sum, mean, 2-D matmul, transpose, reshape; reverse-mode autograd
-- **Three backends as plugins:** CPU (reference), NVIDIA CUDA, Intel GPU (OpenCL)
+- **Three backends as plugins:** CPU (reference, bundled), NVIDIA CUDA and Intel GPU (OpenCL), each in its own package
 - Automatic plugin selection by each plugin's own hardware test
 - Device-side tensor creation (constants and a cross-device-reproducible `randn`), in-place updates
 - Automatic placement: `pt.plan()` profiles devices and picks one by speed and free memory;

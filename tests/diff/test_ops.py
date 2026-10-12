@@ -7,10 +7,7 @@ import unittest
 
 import torch
 
-# Plugins are shared libraries discovered at import time (build with scripts/build-plugins.ps1).
-os.environ.setdefault(
-    "PYTORCHES_PLUGIN_DIR", str(pathlib.Path(__file__).resolve().parents[2] / "plugins" / "bin")
-)
+# Plugins (bundled CPU plus any installed pytorches-<backend> package) are discovered at import.
 import pytorches as pt
 
 torch.manual_seed(0)
