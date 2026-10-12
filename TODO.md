@@ -32,6 +32,7 @@ Fix the cracks now, while there is one backend. These get more expensive with ev
 - [ ] **Capability query**: dtypes supported, max alloc, memory-pool support, so the planner can reason about devices
 - [ ] **Error model**: per-call error strings (thread-local), consistent status codes, documented ownership rules
 - [ ] **Thread-safety contract** written down and tested (concurrent `execute` from multiple threads)
+- [x] Plugin contract written down: [docs/plugin-abi.md](docs/plugin-abi.md) (ownership split, op tiers, execution model, errors, versioning), each rule tagged by how it is enforced today
 - [ ] ABI conformance test suite: a plugin-agnostic Rust/Python harness any plugin can run (alloc/copy round-trip, every advertised op vs CPU)
 - [ ] C header generated from `plugin-abi` (cbindgen) so C/C++ plugin authors don't hand-copy structs
 

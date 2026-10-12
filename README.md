@@ -404,7 +404,9 @@ at its build output.
 ### Writing a plugin
 
 Most users never need this. It's for people adding support for new hardware, or tuning for
-existing hardware, without touching the core.
+existing hardware, without touching the core. The contract between a plugin and the core (who owns what,
+required and optional ops, the execution model, errors, versioning, and what "conforming" means) is
+specified in [docs/plugin-abi.md](https://github.com/tonyt123456/pytorches/blob/main/docs/plugin-abi.md).
 
 1. `cargo new --lib <name>`, set `crate-type = ["cdylib"]`, depend on
    [`pytorches-plugin-abi`](https://github.com/tonyt123456/pytorches/blob/main/crates/plugin-abi/src/lib.rs).
